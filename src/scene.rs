@@ -53,6 +53,17 @@ pub struct SceneUniform {
     pub light_params: [f32; 4],
     // x: chromatic_aberration, yzw: unused (display-only, does not reset accumulation)
     pub display_params: [f32; 4],
+    // x: cloud altitude, y: cloud opacity (density), z: cloud scale (1/m), w: cumulus amount (0..1)
+    pub cloud_params: [f32; 4],
+    // x,y: cloud wind offset (world xz), z: cloud softness, w: stars brightness (0 = off)
+    pub cloud_params2: [f32; 4],
+    pub cloud_color: [f32; 4],
+    // xyz: moon direction, w: moon size multiplier
+    pub moon_dir_size: [f32; 4],
+    // rgb: moon colour * intensity (0 = no moon), w: always visible (1/0)
+    pub moon_color: [f32; 4],
+    // x: star density multiplier, yzw: unused
+    pub star_params: [f32; 4],
 }
 
 #[repr(C)]
@@ -64,7 +75,8 @@ pub struct GpuPrimitive {
     pub scale_and_mat: [f32; 4],
     // x, y, z: rotation (deg), w: csg_op (0: Positive, 1: Negative, 2: Intersecting)
     pub rot_and_csg: [f32; 4],
-    // x: visible (1.0 or 0.0), y: tri_offset, z: tri_count, w: padding
+    // x: visible (1.0 or 0.0). Meshes: y = BVH root node index (binding 7), z = triangle count.
+    // Terrains: y = heightmap float offset, z = grid resolution. Stones: y = lump seed, z = lumpiness.
     pub extra: [f32; 4],
 }
 
@@ -77,6 +89,15 @@ pub struct GpuTriangle {
     pub normal: [f32; 4], // nx, ny, nz, padding
 }
 
+/// Flattened mesh BVH node (see src/bvh.rs for the layout)
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuBvhNode {
+    pub min_first: [f32; 4],
+    pub max_count: [f32; 4],
+}
+
+#[derive(Clone)]
 pub struct SceneController {
     pub terrain: TerrainConfig,
     pub sky: SkyConfig,

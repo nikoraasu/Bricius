@@ -423,6 +423,106 @@ impl HeightmapGrid {
     }
 }
 
+/// Bryce-style whole-map filters (heights are expected in [0,1]; every filter keeps them there).
+impl HeightmapGrid {
+    fn clamp01(&mut self) {
+        for v in &mut self.data {
+            *v = v.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Box-blur smoothing, `passes` times.
+    pub fn smooth(&mut self, passes: usize) {
+        let n = self.resolution;
+        if n < 3 {
+            return;
+        }
+        for _ in 0..passes {
+            let src = self.data.clone();
+            for y in 0..n {
+                for x in 0..n {
+                    let mut sum = 0.0;
+                    let mut cnt = 0.0;
+                    for dy in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let (sx, sy) = (x as i32 + dx, y as i32 + dy);
+                            if sx >= 0 && sy >= 0 && (sx as usize) < n && (sy as usize) < n {
+                                sum += src[sy as usize * n + sx as usize];
+                                cnt += 1.0;
+                            }
+                        }
+                    }
+                    self.data[y * n + x] = sum / cnt;
+                }
+            }
+        }
+    }
+
+    /// Adds `delta` to every height (negative lowers), clamped to [0,1].
+    pub fn offset(&mut self, delta: f32) {
+        for v in &mut self.data {
+            *v += delta;
+        }
+        self.clamp01();
+    }
+
+    pub fn invert(&mut self) {
+        for v in &mut self.data {
+            *v = 1.0 - *v;
+        }
+        self.clamp01();
+    }
+
+    /// Sub-plateau: everything below `level` is raised to `level` (flat lowlands).
+    pub fn clamp_low(&mut self, level: f32) {
+        for v in &mut self.data {
+            *v = v.max(level);
+        }
+        self.clamp01();
+    }
+
+    /// Clip high: everything above `level` is cut flat (mesa tops).
+    pub fn clip_high(&mut self, level: f32) {
+        for v in &mut self.data {
+            *v = v.min(level);
+        }
+        self.clamp01();
+    }
+
+    /// Power curve: exponent > 1 gives spiky peaks and flat valleys, < 1 rounds everything up.
+    pub fn sharpen(&mut self, exponent: f32) {
+        for v in &mut self.data {
+            *v = v.clamp(0.0, 1.0).powf(exponent.max(0.05));
+        }
+    }
+
+    /// Adds deterministic hash noise of the given amplitude.
+    pub fn add_noise(&mut self, amount: f32, seed: u32) {
+        for (i, v) in self.data.iter_mut().enumerate() {
+            let mut h = (i as u32).wrapping_mul(2654435761) ^ seed.wrapping_mul(97531);
+            h ^= h >> 15;
+            h = h.wrapping_mul(2246822519);
+            h ^= h >> 13;
+            let r = (h & 0xffff) as f32 / 65535.0 - 0.5;
+            *v += r * 2.0 * amount;
+        }
+        self.clamp01();
+    }
+
+    /// Stretches the current min..max to the full [0,1] range.
+    pub fn normalize(&mut self) {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in &self.data {
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        let span = (hi - lo).max(1e-4);
+        for v in &mut self.data {
+            *v = (*v - lo) / span;
+        }
+    }
+}
+
 /// A terrain object's heightmap (normalized [0,1]) plus the generator config that produced it
 #[derive(Clone, Debug)]
 pub struct TerrainObjectData {
@@ -467,6 +567,85 @@ impl TerrainObjectData {
         }
         heightmap.unit = 1.0 / 12.0;
         Self { heightmap, config: save.config.clone() }
+    }
+}
+
+/// Drops terrain heightmaps no object references any more (e.g. after deleting a terrain object) and
+/// remaps the remaining objects' `terrain_id`s. Dangling ids are cleared. Returns how many were removed.
+pub fn gc_terrains(objects: &mut [crate::objects::SceneObject], terrains: &mut Vec<TerrainObjectData>) -> usize {
+    let n = terrains.len();
+    let mut used = vec![false; n];
+    for o in objects.iter_mut() {
+        match o.terrain_id {
+            Some(t) if t < n => used[t] = true,
+            Some(_) => o.terrain_id = None,
+            None => {}
+        }
+    }
+    let removed = used.iter().filter(|u| !**u).count();
+    if removed == 0 {
+        return 0;
+    }
+    let mut remap = vec![usize::MAX; n];
+    let mut next = 0;
+    for (i, u) in used.iter().enumerate() {
+        if *u {
+            remap[i] = next;
+            next += 1;
+        }
+    }
+    let mut i = 0;
+    terrains.retain(|_| {
+        i += 1;
+        used[i - 1]
+    });
+    for o in objects.iter_mut() {
+        if let Some(t) = o.terrain_id {
+            o.terrain_id = Some(remap[t]);
+        }
+    }
+    removed
+}
+
+#[cfg(test)]
+mod gc_tests {
+    use super::*;
+    use crate::objects::SceneObject;
+
+    fn obj(name: &str, tid: Option<usize>) -> SceneObject {
+        let mut o = SceneObject::sphere(name, [0.0; 3], 1.0, 0);
+        o.terrain_id = tid;
+        o
+    }
+
+    #[test]
+    fn gc_removes_orphans_and_remaps() {
+        let cfg = TerrainConfig::default();
+        let mut terrains: Vec<TerrainObjectData> = (0..4).map(|i| TerrainObjectData::new(4 + i, &cfg)).collect();
+        // terrain 0 and 2 orphaned; 1 used by two objects, 3 by one
+        let mut objects = vec![obj("a", Some(1)), obj("b", None), obj("c", Some(3)), obj("d", Some(1))];
+        assert_eq!(gc_terrains(&mut objects, &mut terrains), 2);
+        assert_eq!(terrains.len(), 2);
+        assert_eq!(terrains[0].heightmap.resolution, 5);
+        assert_eq!(terrains[1].heightmap.resolution, 7);
+        assert_eq!(objects[0].terrain_id, Some(0));
+        assert_eq!(objects[1].terrain_id, None);
+        assert_eq!(objects[2].terrain_id, Some(1));
+        assert_eq!(objects[3].terrain_id, Some(0));
+        // idempotent
+        assert_eq!(gc_terrains(&mut objects, &mut terrains), 0);
+    }
+
+    #[test]
+    fn gc_clears_dangling_ids() {
+        let mut terrains = vec![TerrainObjectData::new(4, &TerrainConfig::default())];
+        let mut objects = vec![obj("a", Some(5)), obj("b", Some(0))];
+        assert_eq!(gc_terrains(&mut objects, &mut terrains), 0);
+        assert_eq!(objects[0].terrain_id, None);
+        assert_eq!(objects[1].terrain_id, Some(0));
+        let mut none: Vec<SceneObject> = vec![];
+        assert_eq!(gc_terrains(&mut none, &mut terrains), 1);
+        assert!(terrains.is_empty());
     }
 }
 
@@ -600,4 +779,55 @@ fn pseudo_hash(x: u32, z: u32) -> f32 {
     let mut h = x.wrapping_mul(374761393).wrapping_add(z.wrapping_mul(668265263));
     h = (h ^ (h >> 13)).wrapping_mul(1274126177);
     (h as f32) / (u32::MAX as f32)
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn ramp(n: usize) -> HeightmapGrid {
+        let mut g = HeightmapGrid::new(n);
+        for y in 0..n {
+            for x in 0..n {
+                g.data[y * n + x] = x as f32 / (n - 1) as f32;
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn invert_flips_heights() {
+        let mut g = ramp(8);
+        g.invert();
+        assert!((g.data[0] - 1.0).abs() < 1e-6);
+        assert!(g.data[7].abs() < 1e-6);
+    }
+
+    #[test]
+    fn clamp_low_and_clip_high_bound_the_range() {
+        let mut g = ramp(8);
+        g.clamp_low(0.25);
+        assert!(g.data.iter().all(|&v| v >= 0.25 - 1e-6));
+        g.clip_high(0.75);
+        assert!(g.data.iter().all(|&v| v <= 0.75 + 1e-6));
+        assert!((g.data[7] - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn smooth_reduces_variance_and_sharpen_darkens() {
+        let mut g = HeightmapGrid::new(16);
+        g.add_noise(0.5, 3);
+        let var = |g: &HeightmapGrid| {
+            let m = g.data.iter().sum::<f32>() / g.data.len() as f32;
+            g.data.iter().map(|v| (v - m) * (v - m)).sum::<f32>() / g.data.len() as f32
+        };
+        let before = var(&g);
+        g.smooth(2);
+        assert!(var(&g) < before);
+        let mut r = ramp(8);
+        let mid = r.data[3];
+        r.sharpen(2.0);
+        assert!(r.data[3] < mid);
+        assert!(r.data.iter().all(|v| (0.0..=1.0).contains(v)));
+    }
 }

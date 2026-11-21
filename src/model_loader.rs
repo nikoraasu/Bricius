@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Triangle cap per imported mesh (the GPU traverses a BVH, so this can be large)
+pub const MAX_MESH_TRIANGLES: usize = 200_000;
+
 /// Representation of an imported or generated 3D mesh model
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LoadedMesh {
@@ -186,8 +189,8 @@ impl ModelLoader {
 
         combined_mesh.generate_normals_if_missing();
         combined_mesh.compute_bounds_and_normalize(1.0);
-        // Protect GPU real-time performance by capping at 3500 triangles
-        combined_mesh.decimate_if_needed(3500);
+        // Protect GPU memory/performance by capping the triangle count (BVH-accelerated)
+        combined_mesh.decimate_if_needed(MAX_MESH_TRIANGLES);
 
         Ok(combined_mesh)
     }
@@ -230,7 +233,7 @@ impl ModelLoader {
 
         combined_mesh.generate_normals_if_missing();
         combined_mesh.compute_bounds_and_normalize(1.0);
-        combined_mesh.decimate_if_needed(3500);
+        combined_mesh.decimate_if_needed(MAX_MESH_TRIANGLES);
 
         Ok(combined_mesh)
     }
@@ -291,7 +294,7 @@ impl ModelLoader {
 
         combined_mesh.generate_normals_if_missing();
         combined_mesh.compute_bounds_and_normalize(1.0);
-        combined_mesh.decimate_if_needed(3500);
+        combined_mesh.decimate_if_needed(MAX_MESH_TRIANGLES);
 
         Ok(combined_mesh)
     }
@@ -338,7 +341,7 @@ impl ModelLoader {
 
         combined_mesh.generate_normals_if_missing();
         combined_mesh.compute_bounds_and_normalize(1.0);
-        combined_mesh.decimate_if_needed(3500);
+        combined_mesh.decimate_if_needed(MAX_MESH_TRIANGLES);
         Ok(combined_mesh)
     }
 

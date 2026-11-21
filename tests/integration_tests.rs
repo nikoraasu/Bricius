@@ -126,22 +126,25 @@ fn test_export_obj_and_png() {
 
 #[test]
 fn test_material_presets_and_gpu_layout() {
-    // Check GPU struct size (must be 80 bytes for WGSL alignment)
+    // Check GPU struct size (21 x vec4 for WGSL std140 alignment)
     assert_eq!(
         std::mem::size_of::<GpuMaterial>(),
-        80,
-        "GpuMaterial must be exactly 80 bytes"
+        336,
+        "GpuMaterial must be exactly 336 bytes"
     );
 
-    let rock = GpuMaterial::rock();
-    assert!(rock.params1[0] >= 0.0 && rock.params1[0] <= 1.0, "Rock roughness invalid");
+    let mut rock = GpuMaterial::rock();
+    assert!(rock.values1[1] >= 0.0 && rock.values1[1] <= 1.0, "Rock roughness invalid");
+    assert_eq!(rock.src(0), 1, "Rock diffuse should be driven by texture A");
+    assert_eq!(rock.src(5), 1, "Rock bump should be driven by texture A");
+    assert_eq!(*rock.value_mut(5), 0.45, "Rock bump height");
 
-    let chrome = GpuMaterial::chrome();
-    assert_eq!(chrome.params1[1], 1.0, "Chrome should be 100% metallic");
-    assert_eq!(chrome.params1[2], 0.98, "Chrome should have 0.98 reflectivity");
+    let mut chrome = GpuMaterial::chrome();
+    assert_eq!(*chrome.metallic_mut(), 1.0, "Chrome should be 100% metallic");
+    assert_eq!(*chrome.value_mut(3), 0.98, "Chrome should have 0.98 reflection");
 
-    let glass = GpuMaterial::emerald_glass();
-    assert_eq!(glass.params1[3], 0.85, "Glass should be transparent");
+    let mut glass = GpuMaterial::emerald_glass();
+    assert_eq!(*glass.value_mut(4), 0.85, "Glass should be transparent");
 }
 
 #[test]
@@ -311,9 +314,12 @@ fn test_custom_material_copy_and_serialization() {
     let json = serde_json::to_string(&mat).expect("Material should serialize to JSON");
     let deserialized: GpuMaterial = serde_json::from_str(&json).expect("Material should deserialize");
 
-    assert_eq!(mat.params1, deserialized.params1);
-    assert_eq!(mat.params2, deserialized.params2);
-    assert_eq!(mat.base_color, deserialized.base_color);
+    assert_eq!(mat, deserialized);
+
+    // Legacy (pre-texture-channel) JSON migrates to the same material as the preset
+    let legacy = r#"{"base_color":[0.45,0.40,0.35,1.0],"secondary_color":[0.22,0.20,0.18,1.0],
+        "params1":[0.85,0.05,0.05,0.0],"params2":[1.5,0.45,3.5,1.0],"params3":[0.3,5.0,1.5,0.0]}"#;
+    assert_eq!(GpuMaterial::from_json(legacy).expect("legacy material"), GpuMaterial::rock());
 }
 
 #[test]

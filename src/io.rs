@@ -22,6 +22,7 @@ pub struct ProjectFile {
     pub ground: GroundConfig,
     #[serde(default)]
     pub lights: Vec<LightConfig>,
+    #[serde(deserialize_with = "GpuMaterial::deserialize_list")]
     pub materials: Vec<GpuMaterial>,
     pub objects: Vec<SceneObject>,
     pub postprocess: PostProcessConfig,

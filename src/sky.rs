@@ -37,6 +37,47 @@ pub struct SkyConfig {
     pub cloud_color: [f32; 4],
     pub stars_intensity: f32,
     pub moon_phase: f32,
+    /// Cloud wind direction in degrees (0 = +X, 90 = +Z); with `cloud_wind_speed` it sets a static drift offset
+    #[serde(default = "d_wind_dir")]
+    pub cloud_wind_dir: f32,
+    /// 0 = flat cloud sheet, 1 = shaded cumulus (lit side toward the sun, darker undersides)
+    #[serde(default)]
+    pub cloud_cumulus: f32,
+    #[serde(default = "d_true")]
+    pub stars_enabled: bool,
+    #[serde(default = "d_one")]
+    pub stars_density: f32,
+    #[serde(default)]
+    pub moon_enabled: bool,
+    /// Moon direction (radians)
+    #[serde(default = "d_moon_az")]
+    pub moon_azimuth: f32,
+    #[serde(default = "d_moon_el")]
+    pub moon_elevation: f32,
+    #[serde(default = "d_one")]
+    pub moon_size: f32,
+    #[serde(default = "d_moon_color")]
+    pub moon_color: [f32; 4],
+    #[serde(default = "d_one")]
+    pub moon_intensity: f32,
+    /// Show the moon even in daylight
+    #[serde(default)]
+    pub moon_always: bool,
+}
+
+fn d_wind_dir() -> f32 { 30.0 }
+fn d_true() -> bool { true }
+fn d_one() -> f32 { 1.0 }
+fn d_moon_az() -> f32 { 200.0_f32.to_radians() }
+fn d_moon_el() -> f32 { 35.0_f32.to_radians() }
+fn d_moon_color() -> [f32; 4] { [0.85, 0.90, 1.0, 1.0] }
+
+impl SkyConfig {
+    /// Unit direction toward the moon
+    pub fn moon_dir(&self) -> [f32; 3] {
+        let (ce, se) = (self.moon_elevation.cos(), self.moon_elevation.sin());
+        [self.moon_azimuth.cos() * ce, se, self.moon_azimuth.sin() * ce]
+    }
 }
 
 impl Default for SkyConfig {
@@ -46,6 +87,24 @@ impl Default for SkyConfig {
 }
 
 impl SkyConfig {
+    /// Opening look: saturated Bryce-style day sky (deep blue zenith, pale horizon, light haze, a few cumulus)
+    pub fn startup() -> Self {
+        Self {
+            sun_azimuth: 38.0_f32.to_radians(),
+            sun_elevation: 50.0_f32.to_radians(),
+            sun_intensity: 2.6,
+            zenith_color: [0.04, 0.22, 0.80, 1.0],
+            horizon_color: [0.74, 0.86, 0.98, 1.0],
+            fog_density: 0.0025,
+            fog_color: [0.78, 0.88, 0.98, 1.0],
+            mie_coeff: 0.35,
+            cloud_coverage: 0.35,
+            cloud_density: 0.9,
+            cloud_cumulus: 0.7,
+            ..Self::clear_blue()
+        }
+    }
+
     pub fn clear_blue() -> Self {
         Self {
             sky_type: SkyType::ClearBlue,
@@ -71,6 +130,17 @@ impl SkyConfig {
             cloud_color: [0.98, 0.98, 1.0, 1.0],
             stars_intensity: 0.0,
             moon_phase: 0.0,
+            cloud_wind_dir: 30.0,
+            cloud_cumulus: 0.0,
+            stars_enabled: true,
+            stars_density: 1.0,
+            moon_enabled: false,
+            moon_azimuth: 200.0_f32.to_radians(),
+            moon_elevation: 35.0_f32.to_radians(),
+            moon_size: 1.0,
+            moon_color: [0.85, 0.90, 1.0, 1.0],
+            moon_intensity: 1.0,
+            moon_always: false,
         }
     }
 
@@ -90,8 +160,8 @@ impl SkyConfig {
             fog_color: [0.85, 0.60, 0.45, 1.0],
             rayleigh_coeff: 1.5,
             mie_coeff: 1.2,
-            cloud_coverage: 0.65,
-            cloud_density: 1.0,
+            cloud_coverage: 0.95,
+            cloud_density: 1.1,
             cloud_altitude: 55.0,
             cloud_scale: 0.018,
             cloud_softness: 0.7,
@@ -99,6 +169,17 @@ impl SkyConfig {
             cloud_color: [1.0, 0.75, 0.60, 1.0],
             stars_intensity: 0.1,
             moon_phase: 0.2,
+            cloud_wind_dir: 30.0,
+            cloud_cumulus: 0.9,
+            stars_enabled: true,
+            stars_density: 1.0,
+            moon_enabled: false,
+            moon_azimuth: 200.0_f32.to_radians(),
+            moon_elevation: 35.0_f32.to_radians(),
+            moon_size: 1.0,
+            moon_color: [0.85, 0.90, 1.0, 1.0],
+            moon_intensity: 1.0,
+            moon_always: false,
         }
     }
 
@@ -118,15 +199,26 @@ impl SkyConfig {
             fog_color: [0.25, 0.28, 0.32, 1.0],
             rayleigh_coeff: 0.8,
             mie_coeff: 2.5,
-            cloud_coverage: 0.95,
-            cloud_density: 1.8,
-            cloud_altitude: 40.0,
-            cloud_scale: 0.025,
+            cloud_coverage: 1.15,
+            cloud_density: 1.9,
+            cloud_altitude: 28.0,
+            cloud_scale: 0.03,
             cloud_softness: 0.4,
             cloud_wind_speed: 2.5,
             cloud_color: [0.20, 0.22, 0.28, 1.0],
             stars_intensity: 0.0,
             moon_phase: 0.0,
+            cloud_wind_dir: 30.0,
+            cloud_cumulus: 0.35,
+            stars_enabled: true,
+            stars_density: 1.0,
+            moon_enabled: false,
+            moon_azimuth: 200.0_f32.to_radians(),
+            moon_elevation: 35.0_f32.to_radians(),
+            moon_size: 1.0,
+            moon_color: [0.85, 0.90, 1.0, 1.0],
+            moon_intensity: 1.0,
+            moon_always: false,
         }
     }
 
@@ -155,6 +247,17 @@ impl SkyConfig {
             cloud_color: [0.70, 0.40, 0.55, 1.0],
             stars_intensity: 0.4,
             moon_phase: 0.5,
+            cloud_wind_dir: 30.0,
+            cloud_cumulus: 0.0,
+            stars_enabled: true,
+            stars_density: 1.0,
+            moon_enabled: false,
+            moon_azimuth: 200.0_f32.to_radians(),
+            moon_elevation: 35.0_f32.to_radians(),
+            moon_size: 1.0,
+            moon_color: [0.85, 0.90, 1.0, 1.0],
+            moon_intensity: 1.0,
+            moon_always: false,
         }
     }
 
@@ -183,6 +286,17 @@ impl SkyConfig {
             cloud_color: [0.15, 0.18, 0.25, 1.0],
             stars_intensity: 1.8,
             moon_phase: 0.9,
+            cloud_wind_dir: 30.0,
+            cloud_cumulus: 0.0,
+            stars_enabled: true,
+            stars_density: 1.6,
+            moon_enabled: true,
+            moon_azimuth: 172.0_f32.to_radians(),
+            moon_elevation: 16.0_f32.to_radians(),
+            moon_size: 1.6,
+            moon_color: [0.85, 0.90, 1.0, 1.0],
+            moon_intensity: 1.2,
+            moon_always: false,
         }
     }
 
@@ -211,6 +325,17 @@ impl SkyConfig {
             cloud_color: [0.85, 0.35, 0.75, 1.0],
             stars_intensity: 0.6,
             moon_phase: 0.7,
+            cloud_wind_dir: 30.0,
+            cloud_cumulus: 0.0,
+            stars_enabled: true,
+            stars_density: 1.0,
+            moon_enabled: false,
+            moon_azimuth: 200.0_f32.to_radians(),
+            moon_elevation: 35.0_f32.to_radians(),
+            moon_size: 1.0,
+            moon_color: [0.85, 0.90, 1.0, 1.0],
+            moon_intensity: 1.0,
+            moon_always: false,
         }
     }
 
@@ -239,6 +364,17 @@ impl SkyConfig {
             cloud_color: [0.65, 0.10, 0.55, 1.0],
             stars_intensity: 1.0,
             moon_phase: 0.0,
+            cloud_wind_dir: 30.0,
+            cloud_cumulus: 0.0,
+            stars_enabled: true,
+            stars_density: 1.0,
+            moon_enabled: false,
+            moon_azimuth: 200.0_f32.to_radians(),
+            moon_elevation: 35.0_f32.to_radians(),
+            moon_size: 1.0,
+            moon_color: [0.85, 0.90, 1.0, 1.0],
+            moon_intensity: 1.0,
+            moon_always: false,
         }
     }
 }

@@ -12,6 +12,7 @@ pub enum PrimitiveType {
     Plane,
     Mesh,
     Terrain,
+    Stone,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +35,16 @@ pub struct SceneObject {
     pub mesh_id: Option<usize>,
     #[serde(default)]
     pub terrain_id: Option<usize>,
+    /// Stone only: noise seed that defines the lump pattern
+    #[serde(default)]
+    pub stone_seed: u32,
+    /// Stone only: lumpiness multiplier (0 = smooth ellipsoid, 1 = default, 2 = very craggy)
+    #[serde(default = "default_lumpiness")]
+    pub stone_lumpiness: f32,
+}
+
+fn default_lumpiness() -> f32 {
+    1.0
 }
 
 impl SceneObject {
@@ -49,6 +60,8 @@ impl SceneObject {
             visible: true,
             mesh_id: None,
             terrain_id: None,
+            stone_seed: 0,
+            stone_lumpiness: 1.0,
         }
     }
 
@@ -64,6 +77,8 @@ impl SceneObject {
             visible: true,
             mesh_id: None,
             terrain_id: None,
+            stone_seed: 0,
+            stone_lumpiness: 1.0,
         }
     }
 
@@ -79,6 +94,8 @@ impl SceneObject {
             visible: true,
             mesh_id: None,
             terrain_id: None,
+            stone_seed: 0,
+            stone_lumpiness: 1.0,
         }
     }
 
@@ -94,6 +111,44 @@ impl SceneObject {
             visible: true,
             mesh_id: None,
             terrain_id: None,
+            stone_seed: 0,
+            stone_lumpiness: 1.0,
+        }
+    }
+
+    /// Cone with its base at -half_height and its apex at +half_height (local Y)
+    pub fn cone(name: &str, pos: [f32; 3], radius: f32, half_height: f32, material_id: u32) -> Self {
+        Self {
+            name: name.to_string(),
+            primitive: PrimitiveType::Cone,
+            csg_op: CsgOp::Positive,
+            position: pos,
+            rotation: [0.0, 0.0, 0.0],
+            scale: [radius, half_height, radius],
+            material_id,
+            visible: true,
+            mesh_id: None,
+            terrain_id: None,
+            stone_seed: 0,
+            stone_lumpiness: 1.0,
+        }
+    }
+
+    /// Square pyramid: base half-extents (x, z), base at -half_height, apex at +half_height
+    pub fn pyramid(name: &str, pos: [f32; 3], half_extents: [f32; 2], half_height: f32, material_id: u32) -> Self {
+        Self {
+            name: name.to_string(),
+            primitive: PrimitiveType::Pyramid,
+            csg_op: CsgOp::Positive,
+            position: pos,
+            rotation: [0.0, 0.0, 0.0],
+            scale: [half_extents[0], half_height, half_extents[1]],
+            material_id,
+            visible: true,
+            mesh_id: None,
+            terrain_id: None,
+            stone_seed: 0,
+            stone_lumpiness: 1.0,
         }
     }
 
@@ -109,6 +164,8 @@ impl SceneObject {
             visible: true,
             mesh_id: Some(mesh_id),
             terrain_id: None,
+            stone_seed: 0,
+            stone_lumpiness: 1.0,
         }
     }
 
@@ -125,6 +182,26 @@ impl SceneObject {
             visible: true,
             mesh_id: None,
             terrain_id: Some(terrain_id),
+            stone_seed: 0,
+            stone_lumpiness: 1.0,
+        }
+    }
+
+    /// Bryce-style rock: a noise-displaced ellipsoid (scale = semi-axes), default material 0 (Mountain Rock)
+    pub fn stone(name: &str, pos: [f32; 3], scale: [f32; 3], seed: u32, material_id: u32) -> Self {
+        Self {
+            name: name.to_string(),
+            primitive: PrimitiveType::Stone,
+            csg_op: CsgOp::Positive,
+            position: pos,
+            rotation: [0.0, 0.0, 0.0],
+            scale,
+            material_id,
+            visible: true,
+            mesh_id: None,
+            terrain_id: None,
+            stone_seed: seed,
+            stone_lumpiness: 1.0,
         }
     }
 
@@ -188,9 +265,15 @@ impl SceneObject {
                 }
                 None
             }
-            PrimitiveType::Cube => {
-                let min = -scale;
-                let max = scale;
+            PrimitiveType::Cube | PrimitiveType::Cone | PrimitiveType::Pyramid => {
+                // Cone / pyramid picking uses their bounding box
+                let ext = if self.primitive == PrimitiveType::Cone {
+                    glam::Vec3::new(scale.x, scale.y, scale.x)
+                } else {
+                    scale
+                };
+                let min = -ext;
+                let max = ext;
                 let inv_d = glam::Vec3::new(
                     1.0 / rd_local.x.abs().max(1e-6) * rd_local.x.signum(),
                     1.0 / rd_local.y.abs().max(1e-6) * rd_local.y.signum(),
@@ -235,7 +318,24 @@ impl SceneObject {
                 }
                 None
             }
-            PrimitiveType::Terrain | PrimitiveType::Mesh | PrimitiveType::Cone | PrimitiveType::Pyramid | PrimitiveType::Plane => {
+            PrimitiveType::Stone => {
+                // Bounding ellipsoid (slightly padded for the lumps): unit-sphere test in scaled space
+                let inv = glam::Vec3::ONE / (scale * 1.2).max(glam::Vec3::splat(1e-3));
+                let o = ro_local * inv;
+                let d = rd_local * inv;
+                let a = d.dot(d);
+                let b = o.dot(d);
+                let c = o.dot(o) - 1.0;
+                let disc = b * b - a * c;
+                if disc > 0.0 && a > 1e-9 {
+                    let t = (-b - disc.sqrt()) / a;
+                    if t > 0.05 {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            PrimitiveType::Terrain | PrimitiveType::Mesh | PrimitiveType::Plane => {
                 // Bounding sphere/box hit test for picking
                 let max_dim = scale.max_element().max(0.5);
                 let b = ro_local.dot(rd_local);

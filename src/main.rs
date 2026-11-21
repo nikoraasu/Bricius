@@ -1,3 +1,4 @@
+mod bvh;
 mod camera;
 mod editor;
 mod generator;
@@ -5,6 +6,7 @@ mod ground;
 mod io;
 mod light;
 mod material;
+mod preview;
 mod model_loader;
 mod objects;
 mod postprocess;
@@ -12,6 +14,8 @@ mod scene;
 mod sky;
 mod state;
 mod terrain;
+mod ui;
+mod undo;
 mod water;
 
 use std::sync::Arc;
@@ -85,7 +89,15 @@ impl ApplicationHandler for App {
         } = &event
         {
             if *key_code == KeyCode::Escape {
-                event_loop.exit();
+                if *element_state == ElementState::Pressed {
+                    if state.editor.active_lab.is_some() {
+                        state.editor.lab_cancel_requested = true;
+                    } else if state.editor.show_help {
+                        state.editor.show_help = false;
+                    } else {
+                        event_loop.exit();
+                    }
+                }
                 return;
             }
             if *key_code == KeyCode::Tab && *element_state == ElementState::Pressed {
@@ -93,7 +105,7 @@ impl ApplicationHandler for App {
                 return;
             }
             if *key_code == KeyCode::F1 && *element_state == ElementState::Pressed {
-                state.editor.active_lab = crate::editor::ActiveLab::Tutorial;
+                state.editor.show_help = !state.editor.show_help;
                 state.editor.visible = true;
                 return;
             }
@@ -116,13 +128,17 @@ impl ApplicationHandler for App {
                     state.last_mouse_pos = None;
                 } else if *element_state == ElementState::Pressed {
                     if *button == MouseButton::Right {
-                        // RMB drag always navigates the 3D viewport
-                        state.mouse_pressed = true;
-                        state.dragging_object = false;
-                        state.last_mouse_pos = None;
+                        // RMB drag navigates the 3D viewport (only when started over the framed viewport)
+                        if state.pointer_in_viewport() {
+                            state.mouse_pressed = true;
+                            state.dragging_object = false;
+                            state.last_mouse_pos = None;
+                        }
                     } else if *button == MouseButton::Left {
                         // LMB: Click to select & drag objects, or drag viewport if clicking background
-                        let over_egui = if state.editor.visible {
+                        let over_egui = if !state.pointer_in_viewport() {
+                            true
+                        } else if state.editor.visible {
                             if let Some(pos) = state.egui_ctx.input(|i| i.pointer.latest_pos()) {
                                 if let Some(layer) = state.egui_ctx.layer_id_at(pos) {
                                     layer.order != egui::Order::Background
@@ -137,11 +153,12 @@ impl ApplicationHandler for App {
                         };
 
                         if !over_egui {
-                            let mx = state.last_mouse_pos.map(|(x, _)| x).unwrap_or(state.config.width as f64 * 0.5);
-                            let my = state.last_mouse_pos.map(|(_, y)| y).unwrap_or(state.config.height as f64 * 0.5);
-                            let w = state.config.width as f32;
-                            let h = state.config.height as f32;
-                            let (ro, rd) = state.camera.screen_to_ray(mx as f32, my as f32, w, h);
+                            let mx = state.cursor_pos.map(|(x, _)| x).unwrap_or(state.config.width as f64 * 0.5);
+                            let my = state.cursor_pos.map(|(_, y)| y).unwrap_or(state.config.height as f64 * 0.5);
+                            let (vx, vy, vw, vh) = state.viewport_px();
+                            let (w, h) = (vw as f32, vh as f32);
+                            let (mx, my) = (mx - vx as f64, my - vy as f64);
+                            let (ro, rd) = state.cam().screen_to_ray(mx as f32, my as f32, w, h);
 
                             let mut closest_hit: Option<(usize, f32)> = None;
                             for (i, obj) in state.objects.iter().enumerate() {
@@ -159,7 +176,7 @@ impl ApplicationHandler for App {
                                 state.drag_start_obj_pos = glam::Vec3::from(state.objects[hit_idx].position);
                                 state.drag_start_mouse = glam::Vec2::new(mx as f32, my as f32);
                                 state.mouse_pressed = true;
-                                state.editor.status_message = format!("Selected '{}' - Drag in viewport to move (⇧ Shift: Height, ⌥ Alt: Scale)", state.objects[hit_idx].name);
+                                state.editor.status_message = format!("Selected '{}' - Drag in viewport to move (Shift: Height, Alt: Scale)", state.objects[hit_idx].name);
                             } else {
                                 state.mouse_pressed = true;
                                 state.dragging_object = false;
@@ -168,13 +185,37 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let over_egui = state
+                    .cursor_pos
+                    .map(|(x, y)| {
+                        let ppp = state.egui_ctx.pixels_per_point();
+                        let pos = egui::pos2(x as f32 / ppp, y as f32 / ppp);
+                        state.egui_ctx.layer_id_at(pos).map_or(false, |l| l.order != egui::Order::Background)
+                    })
+                    .unwrap_or(false);
+                if state.pointer_in_viewport() && !over_egui {
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
+                    };
+                    let cam = state.cam_mut();
+                    if cam.is_ortho() {
+                        cam.zoom_ortho(0.9_f32.powf(lines));
+                    } else {
+                        let step = cam.forward() * (lines * 1.5);
+                        cam.position += step;
+                    }
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let curr_x = position.x;
                 let curr_y = position.y;
+                state.cursor_pos = Some((curr_x, curr_y));
 
                 if state.dragging_object && state.editor.selected_object_idx < state.objects.len() {
-                    let w = state.config.width as f32;
-                    let h = state.config.height as f32;
+                    let (vx, vy, vw, vh) = state.viewport_px();
+                    let (w, h) = (vw as f32, vh as f32);
                     let obj_idx = state.editor.selected_object_idx;
 
                     let shift_pressed = state.keys_pressed.contains(&KeyCode::ShiftLeft) || state.keys_pressed.contains(&KeyCode::ShiftRight);
@@ -197,14 +238,20 @@ impl ApplicationHandler for App {
                         }
                     } else {
                         // Normal Drag: Smooth 3D plane translation
-                        let (ro, rd) = state.camera.screen_to_ray(curr_x as f32, curr_y as f32, w, h);
-                        let plane_y = state.drag_start_obj_pos.y;
-                        if rd.y.abs() > 0.001 {
-                            let t = (plane_y - ro.y) / rd.y;
-                            if t > 0.1 && t < 300.0 {
+                        let (ro, rd) = state.cam().screen_to_ray((curr_x - vx as f64) as f32, (curr_y - vy as f64) as f32, w, h);
+                        // Perspective: slide on the horizontal plane through the object.
+                        // Orthographic: slide on the view plane (axes perpendicular to the view direction).
+                        let plane_n = if state.cam().is_ortho() { state.cam().forward() } else { glam::Vec3::Y };
+                        let denom = rd.dot(plane_n);
+                        if denom.abs() > 0.001 {
+                            let t = (state.drag_start_obj_pos - ro).dot(plane_n) / denom;
+                            if t > 0.1 && t < 600.0 {
                                 let hit_point = ro + rd * t;
-                                state.objects[obj_idx].position[0] = hit_point.x;
-                                state.objects[obj_idx].position[2] = hit_point.z;
+                                for axis in 0..3 {
+                                    if plane_n[axis].abs() < 0.5 {
+                                        state.objects[obj_idx].position[axis] = hit_point[axis];
+                                    }
+                                }
                             }
                         }
                     }
@@ -213,7 +260,7 @@ impl ApplicationHandler for App {
                     if let Some((last_x, last_y)) = state.last_mouse_pos {
                         let dx = (curr_x - last_x) as f32;
                         let dy = (curr_y - last_y) as f32;
-                        state.camera.rotate(dx, dy);
+                        state.cam_mut().rotate(dx, dy);
                     }
                     state.last_mouse_pos = Some((curr_x, curr_y));
                 } else {
@@ -234,7 +281,7 @@ impl ApplicationHandler for App {
             let _ = state.egui_winit_state.on_window_event(&state.window, &event);
         }
 
-        // 5. Keyboard Navigation & Material Shortcuts (when egui is not focused on text input)
+        // 5. Keyboard Navigation (when egui is not focused on text input)
         if !state.egui_ctx.egui_wants_keyboard_input() {
             if let WindowEvent::KeyboardInput {
                 event:
@@ -249,52 +296,6 @@ impl ApplicationHandler for App {
                 match element_state {
                     ElementState::Pressed => {
                         state.keys_pressed.insert(key_code);
-
-                        // Quick material swap keys [1] through [8] on central showcase orb
-                        use crate::material::GpuMaterial;
-                        match key_code {
-                            KeyCode::Digit1 => {
-                                state.materials[1] = GpuMaterial::rock();
-                                state.material_dirty = true;
-                                state.editor.status_message = "Applied Mountain Rock material.".to_string();
-                            }
-                            KeyCode::Digit2 => {
-                                state.materials[1] = GpuMaterial::blue_marble();
-                                state.material_dirty = true;
-                                state.editor.status_message = "Applied Blue Marble material.".to_string();
-                            }
-                            KeyCode::Digit3 => {
-                                state.materials[1] = GpuMaterial::chrome();
-                                state.material_dirty = true;
-                                state.editor.status_message = "Applied 90s Mirror Chrome material.".to_string();
-                            }
-                            KeyCode::Digit4 => {
-                                state.materials[1] = GpuMaterial::emerald_glass();
-                                state.material_dirty = true;
-                                state.editor.status_message = "Applied Emerald Glass material.".to_string();
-                            }
-                            KeyCode::Digit5 => {
-                                state.materials[1] = GpuMaterial::gold();
-                                state.material_dirty = true;
-                                state.editor.status_message = "Applied Hammered Gold material.".to_string();
-                            }
-                            KeyCode::Digit6 => {
-                                state.materials[1] = GpuMaterial::basalt_obsidian();
-                                state.material_dirty = true;
-                                state.editor.status_message = "Applied Basalt Obsidian material.".to_string();
-                            }
-                            KeyCode::Digit7 => {
-                                state.materials[1] = GpuMaterial::ocean_water();
-                                state.material_dirty = true;
-                                state.editor.status_message = "Applied Ocean Water material.".to_string();
-                            }
-                            KeyCode::Digit8 => {
-                                state.materials[1] = GpuMaterial::alien_bioluminescent();
-                                state.material_dirty = true;
-                                state.editor.status_message = "Applied Alien Bioluminescent material.".to_string();
-                            }
-                            _ => {}
-                        }
                     }
                     ElementState::Released => {
                         state.keys_pressed.remove(&key_code);
@@ -317,7 +318,7 @@ fn main() {
     println!(" Bricius - Complete 3D Environment Creation Studio");
     println!(" Controls:");
     println!("  - Tab              : Toggle Studio Editor UI on/off");
-    println!("  - F1               : Open In-Studio Interactive Tutorial & Guide");
+    println!("  - F1               : Controls help overlay");
     println!("  - F9               : Render Still Frame to PNG (Capture artwork)");
     println!("  - LMB Click Object : Select 3D object in viewport");
     println!("  - LMB Drag Object  : Move object across landscape (XZ plane)");
@@ -329,8 +330,7 @@ fn main() {
     println!("  - Shift / Q        : Fly camera Down");
     println!("  - Arrow Left/Right : Rotate Sun Azimuth (360° celestial orbit)");
     println!("  - Arrow Up/Down    : Adjust Sun Elevation (dawn to dusk)");
-    println!("  - 1 through 8      : Quick-swap procedural materials on showcase orb");
-    println!("  - ESC              : Exit Studio");
+    println!("  - ESC              : Cancel open lab / close help / exit Studio");
     println!("============================================================");
 
     let event_loop = EventLoop::new().unwrap();
