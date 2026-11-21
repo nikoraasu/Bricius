@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkyType {
     ClearBlue,
-    BryceSunset,
+    #[serde(alias = "BryceSunset")]
+    RetroSunset,
     DramaticStorm,
     TwilightGlow,
     StarryNight,
@@ -40,7 +41,7 @@ pub struct SkyConfig {
 
 impl Default for SkyConfig {
     fn default() -> Self {
-        Self::bryce_sunset()
+        Self::retro_sunset()
     }
 }
 
@@ -73,16 +74,16 @@ impl SkyConfig {
         }
     }
 
-    pub fn bryce_sunset() -> Self {
+    pub fn retro_sunset() -> Self {
         Self {
-            sky_type: SkyType::BryceSunset,
+            sky_type: SkyType::RetroSunset,
             sun_azimuth: 45.0_f32.to_radians(),
             sun_elevation: 12.0_f32.to_radians(),
             sun_intensity: 2.4,
             sun_color: [1.0, 0.85, 0.55, 1.0],
             sun_size: 1.6,
             zenith_color: [0.15, 0.25, 0.65, 1.0],
-            horizon_color: [0.98, 0.55, 0.25, 1.0], // Classic 90s Bryce golden-orange
+            horizon_color: [0.98, 0.55, 0.25, 1.0], // Classic 90s golden-orange
             ground_color: [0.15, 0.12, 0.18, 1.0],
             fog_density: 0.008,
             fog_height_falloff: 0.05,

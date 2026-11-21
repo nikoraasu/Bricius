@@ -4,15 +4,16 @@ use glam::Vec3;
 use crate::camera::Camera;
 use crate::generator::{SceneGenerator, SceneTheme};
 use crate::io::{ProjectFile, ProjectIO};
+use crate::light::{LightConfig, LightKind, MAX_LIGHTS};
 use crate::material::GpuMaterial;
 use crate::objects::{CsgOp, SceneObject, ScatterSystem};
 use crate::scene::SceneController;
-use crate::terrain::{BrushMode, HeightmapGrid, TerrainAlgorithm};
+use crate::terrain::{BrushMode, TerrainAlgorithm, TerrainConfig, TerrainObjectData};
 use crate::water::WaterType;
 
-/// Classic Bryce elevation colormap with smooth linear interpolation:
+/// Classic hypsometric elevation colormap with smooth linear interpolation:
 /// deep water -> shallow -> sand -> forest -> rock -> granite -> snow
-fn height_to_bryce_color(h: f32) -> Color32 {
+fn height_to_hypsometric_color(h: f32) -> Color32 {
     let stops: &[(f32, Color32)] = &[
         (-2.0, Color32::from_rgb(14, 38, 85)),    // Deep oceanic trench
         (-0.5, Color32::from_rgb(22, 65, 130)),   // Deep water
@@ -63,14 +64,16 @@ pub struct EditorState {
     pub active_lab: ActiveLab,
     pub selected_material_slot: usize,
     pub selected_object_idx: usize,
+    pub selected_light_idx: usize,
     pub brush_mode: BrushMode,
     pub brush_radius: usize,
     pub brush_strength: f32,
     #[allow(dead_code)]
     pub brush_target_height: f32,
-    pub heightmap: HeightmapGrid,
+    /// Preview texture of the selected terrain object's heightmap (Terrain lab canvas)
     pub heightmap_dirty: bool,
     pub heightmap_texture: Option<egui::TextureHandle>,
+    pub heightmap_preview_key: Option<(usize, usize)>,
     pub scatter_config: ScatterSystem,
     pub tutorial_step: usize,
     pub show_controls_hud: bool,
@@ -83,14 +86,13 @@ pub struct EditorState {
     pub copied_material: Option<GpuMaterial>,
     pub status_message: String,
     pub fps: f32,
+    pub samples_done: u32,
+    pub sample_target: u32,
     pub frame_time_ms: f32,
 }
 
 impl EditorState {
     pub fn new() -> Self {
-        let mut heightmap = HeightmapGrid::new(128);
-        heightmap.generate_from_config(&crate::terrain::TerrainConfig::default());
-
         let material_names = [
             "Mountain Rock".to_string(),
             "Blue Marble".to_string(),
@@ -100,7 +102,7 @@ impl EditorState {
             "Basalt Obsidian".to_string(),
             "Ocean Water".to_string(),
             "Bioluminescent".to_string(),
-            "Bryce Plastic".to_string(),
+            "Retro Plastic".to_string(),
             "Sandstone Strata".to_string(),
             "Glacial Ice".to_string(),
             "Wood Grain".to_string(),
@@ -115,13 +117,14 @@ impl EditorState {
             active_lab: ActiveLab::Tutorial,
             selected_material_slot: 1,
             selected_object_idx: 0,
+            selected_light_idx: 0,
             brush_mode: BrushMode::Raise,
             brush_radius: 8,
             brush_strength: 0.5,
-            brush_target_height: 5.0,
-            heightmap,
+            brush_target_height: 0.4,
             heightmap_dirty: true,
             heightmap_texture: None,
+            heightmap_preview_key: None,
             scatter_config: ScatterSystem::default(),
             tutorial_step: 0,
             show_controls_hud: true,
@@ -131,8 +134,10 @@ impl EditorState {
             model_file_path_input: String::new(),
             uniform_scale_locked: true,
             copied_material: None,
-            status_message: "Welcome to Bryce 7 Pro Studio! Follow the tutorial or press F1 anytime.".to_string(),
+            status_message: "Welcome to Bricius! Follow the tutorial or press F1 anytime.".to_string(),
             fps: 60.0,
+            samples_done: 0,
+            sample_target: 1,
             frame_time_ms: 16.6,
         }
     }
@@ -147,38 +152,21 @@ impl EditorState {
         meshes: &mut Vec<crate::model_loader::LoadedMesh>,
         material_dirty: &mut bool,
         mesh_dirty: &mut bool,
+        terrains: &mut Vec<TerrainObjectData>,
+        terrain_dirty: &mut bool,
     ) {
         if !self.visible {
             egui::Area::new(egui::Id::new("minimized_bar"))
                 .fixed_pos(egui::pos2(12.0, 12.0))
                 .show(ctx, |ui: &mut Ui| {
-                    if ui.button(RichText::new("⚡ Open Bryce 7 Studio").strong()).clicked() {
+                    if ui.button(RichText::new("⚡ Open Bricius").strong()).clicked() {
                         self.visible = true;
                     }
                 });
             return;
         }
 
-        // Synchronize 2D Heightmap Canvas Texture if dirty
-        if self.heightmap_dirty || self.heightmap_texture.is_none() {
-            let res = self.heightmap.resolution;
-            let mut pixels = vec![Color32::BLACK; res * res];
-            for y in 0..res {
-                for x in 0..res {
-                    let h = self.heightmap.data[y * res + x];
-                    pixels[y * res + x] = height_to_bryce_color(h);
-                }
-            }
-            let img = egui::ColorImage::new([res, res], pixels);
-            if let Some(ref mut handle) = self.heightmap_texture {
-                handle.set(img, egui::TextureOptions::LINEAR);
-            } else {
-                self.heightmap_texture = Some(ctx.load_texture("heightmap_preview", img, egui::TextureOptions::LINEAR));
-            }
-            self.heightmap_dirty = false;
-        }
-
-        // Apply dark skeuomorphic Bryce visuals
+        // Apply dark skeuomorphic visuals
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(22, 24, 28);
         visuals.window_fill = Color32::from_rgba_unmultiplied(26, 29, 36, 245);
@@ -192,9 +180,9 @@ impl EditorState {
         let screen = ctx.viewport_rect();
 
         // =========================================================================
-        // TOP BRYCE 7 SHELF (TOOLBAR)
+        // TOP BRICIUS SHELF (TOOLBAR)
         // =========================================================================
-        egui::Area::new(egui::Id::new("bryce_top_shelf"))
+        egui::Area::new(egui::Id::new("bricius_top_shelf"))
             .fixed_pos(egui::pos2(0.0, 0.0))
             .show(ctx, |ui: &mut Ui| {
                 egui::Frame::new()
@@ -203,8 +191,8 @@ impl EditorState {
                     .show(ui, |ui: &mut Ui| {
                         ui.set_width(screen.width() - 32.0);
                         ui.horizontal(|ui: &mut Ui| {
-                            ui.label(RichText::new("BRYCE 7").size(20.0).strong().color(Color32::from_rgb(0, 225, 255)));
-                            ui.label(RichText::new("PRO STUDIO").size(11.0).color(Color32::from_rgb(255, 190, 0)));
+                            ui.label(RichText::new("BRICIUS").size(20.0).strong().color(Color32::from_rgb(0, 225, 255)));
+                            ui.label(RichText::new("STUDIO").size(11.0).color(Color32::from_rgb(255, 190, 0)));
                             ui.separator();
 
                             let labs = [
@@ -242,6 +230,7 @@ impl EditorState {
                                     self.request_render = true;
                                 }
                                 ui.label(format!("{:.1} FPS ({:.1} ms)", self.fps, self.frame_time_ms));
+                                ui.label(format!("Samples: {} / {}", self.samples_done, self.sample_target));
                             });
                         });
                     });
@@ -251,7 +240,7 @@ impl EditorState {
         // FLOATING CONTROLS QUICK REFERENCE HUD OVERLAY
         // =========================================================================
         if self.show_controls_hud {
-            egui::Area::new(egui::Id::new("bryce_controls_hud_card"))
+            egui::Area::new(egui::Id::new("bricius_controls_hud_card"))
                 .fixed_pos(egui::pos2(screen.width() - 315.0, 65.0))
                 .show(ctx, |ui: &mut Ui| {
                     egui::Frame::new()
@@ -338,13 +327,13 @@ impl EditorState {
             egui::ScrollArea::vertical().show(ui, |ui: &mut Ui| {
                 match self.active_lab {
                     ActiveLab::Tutorial => {
-                        self.draw_tutorial_lab(ui, scene_ctrl, camera, materials, objects, material_dirty);
+                        self.draw_tutorial_lab(ui, scene_ctrl, camera, materials, objects, terrains, material_dirty);
                     }
                     ActiveLab::Generator => {
                         self.draw_generator_lab(ui, scene_ctrl, materials, objects);
                     }
                     ActiveLab::Terrain => {
-                        self.draw_terrain_lab(ui, scene_ctrl);
+                        self.draw_terrain_lab(ui, scene_ctrl, objects, terrains, terrain_dirty, camera);
                     }
                     ActiveLab::Sky => {
                         self.draw_sky_lab(ui, scene_ctrl);
@@ -356,10 +345,10 @@ impl EditorState {
                         self.draw_materials_lab(ui, materials, objects, scene_ctrl, material_dirty);
                     }
                     ActiveLab::Scene => {
-                        self.draw_scene_lab(ui, scene_ctrl, objects, meshes, camera, mesh_dirty);
+                        self.draw_scene_lab(ui, scene_ctrl, objects, meshes, camera, mesh_dirty, terrains, terrain_dirty);
                     }
                     ActiveLab::Render => {
-                        self.draw_render_lab(ui, scene_ctrl, camera, materials, objects);
+                        self.draw_render_lab(ui, scene_ctrl, camera, materials, objects, terrains, terrain_dirty);
                     }
                 }
             });
@@ -368,12 +357,13 @@ impl EditorState {
         // =========================================================================
         // 3D VIEWPORT SELECTION BRACKETS & TRANSFORM GIZMO OVERLAY
         // =========================================================================
+        self.draw_light_markers(ctx, camera, &scene_ctrl.lights, screen.width(), screen.height());
         self.draw_viewport_gizmo(ctx, camera, objects, screen.width(), screen.height());
 
         // =========================================================================
         // BOTTOM STATUS BAR
         // =========================================================================
-        egui::Area::new(egui::Id::new("bryce_status_bar"))
+        egui::Area::new(egui::Id::new("bricius_status_bar"))
             .fixed_pos(egui::pos2(0.0, screen.height() - 28.0))
             .show(ctx, |ui: &mut Ui| {
                 egui::Frame::new()
@@ -399,9 +389,10 @@ impl EditorState {
         camera: &mut Camera,
         materials: &mut [GpuMaterial; GpuMaterial::NUM_PRESETS],
         objects: &mut Vec<SceneObject>,
+        terrains: &[TerrainObjectData],
         material_dirty: &mut bool,
     ) {
-        ui.heading("🎓 Bryce 7 Pro Interactive Studio Tutorial");
+        ui.heading("🎓 Bricius Interactive Studio Tutorial");
         ui.label(RichText::new("A complete hands-on guide to 3D environment creation, procedural algorithms, and studio controls.").size(12.0).color(Color32::from_rgb(180, 195, 215)));
 
         ui.separator();
@@ -455,7 +446,7 @@ impl EditorState {
             0 => {
                 // Step 1: Navigation
                 ui.heading("Step 1: 6-DOF Fly Camera & Navigation Controls");
-                ui.label("Bryce uses a continuous 3D coordinate system where you can freely navigate and frame your scene from any angle.");
+                ui.label("Bricius uses a continuous 3D coordinate system where you can freely navigate and frame your scene from any angle.");
 
                 ui.group(|ui| {
                     ui.label(RichText::new("⌨️ Core Navigation Keys:").strong().color(Color32::from_rgb(0, 220, 240)));
@@ -515,16 +506,16 @@ impl EditorState {
             1 => {
                 // Step 2: World Generation
                 ui.heading("Step 2: One-Click Procedural Worlds & Themes");
-                ui.label("One of Bryce's signature hallmarks is the ability to instantly generate an entire surreal or photorealistic world with a single click.");
+                ui.label("One of Bricius's signature hallmarks is the ability to instantly generate an entire surreal or photorealistic world with a single click.");
                 ui.label("A generated world configures fractal terrain elevation, atmospheric Rayleigh/Mie scattering, Gerstner ocean waves, and 3D compositions.");
 
                 ui.group(|ui| {
                     ui.label(RichText::new("⚡ Try One-Click Themes:").strong().color(Color32::from_rgb(0, 220, 240)));
                     ui.horizontal(|ui| {
-                        if ui.button("🏜️ Classic Bryce 1994").clicked() {
+                        if ui.button("🏜️ Classic 1994").clicked() {
                             let seed = rand_pseudo_u32();
                             SceneGenerator::generate_world(
-                                SceneTheme::ClassicBryce1994,
+                                SceneTheme::Classic1994Canyon,
                                 seed,
                                 &mut scene_ctrl.terrain,
                                 &mut scene_ctrl.sky,
@@ -532,9 +523,7 @@ impl EditorState {
                                 objects,
                                 &mut scene_ctrl.postprocess,
                             );
-                            self.heightmap.generate_from_config(&scene_ctrl.terrain);
-                            self.heightmap_dirty = true;
-                            self.status_message = "Generated Classic Bryce 1994 Canyon.".to_string();
+                            self.status_message = "Generated Classic 1994 Canyon.".to_string();
                         }
                         if ui.button("🏔️ Alpine Fjord").clicked() {
                             let seed = rand_pseudo_u32();
@@ -547,8 +536,6 @@ impl EditorState {
                                 objects,
                                 &mut scene_ctrl.postprocess,
                             );
-                            self.heightmap.generate_from_config(&scene_ctrl.terrain);
-                            self.heightmap_dirty = true;
                             self.status_message = "Generated Alpine Fjord & Glacial Lake.".to_string();
                         }
                         if ui.button("🪐 Alien Pandora").clicked() {
@@ -562,8 +549,6 @@ impl EditorState {
                                 objects,
                                 &mut scene_ctrl.postprocess,
                             );
-                            self.heightmap.generate_from_config(&scene_ctrl.terrain);
-                            self.heightmap_dirty = true;
                             self.status_message = "Generated Alien World of Pandora.".to_string();
                         }
                     });
@@ -580,8 +565,6 @@ impl EditorState {
                     }
                     if ui.button("🎲 Reroll Terrain Only").clicked() {
                         SceneGenerator::reroll_terrain(rand_pseudo_u32(), &mut scene_ctrl.terrain);
-                        self.heightmap.generate_from_config(&scene_ctrl.terrain);
-                        self.heightmap_dirty = true;
                         self.status_message = "Rerolled terrain without touching sky or objects.".to_string();
                     }
                 });
@@ -599,7 +582,7 @@ impl EditorState {
             2 => {
                 // Step 3: Terrain & Sculpting
                 ui.heading("Step 3: Ken Musgrave Fractals & 2D Heightmap Canvas");
-                ui.label("Bryce's terrains were designed by procedural graphics pioneer Ken Musgrave. You can choose from 6 procedural noise algorithms:");
+                ui.label("Terrain uses procedural noise algorithms pioneered by graphics researcher Ken Musgrave. You can choose from 6 procedural noise algorithms:");
                 ui.label("• Fractional Brownian Motion (fBm): classic natural mountain ranges.\n• Ridged Multifractal: sharp mountain crests, peaks, and steep canyon gorges.\n• Billow Noise: smooth rolling sand dunes and soft hills.\n• Worley Cellular: basalt columns, rock fractures, and desert mesas.\n• Domain Warping: alien fluid swirls and folded rock strata.\n• Hybrid Multifractal: smooth valley floors transitioning into jagged cliffs.");
 
                 ui.group(|ui| {
@@ -612,25 +595,7 @@ impl EditorState {
                 ui.label(RichText::new("🌧️ Geological Erosion Passes:").strong());
                 ui.label("Simulate natural weathering processes with a single click:");
 
-                ui.horizontal(|ui| {
-                    if ui.button("🌧️ Apply Hydraulic Rain Erosion").clicked() {
-                        self.heightmap.simulate_hydraulic_erosion(4);
-                        self.heightmap_dirty = true;
-                        self.status_message = "Applied 4 cycles of hydraulic rainfall & silt deposition.".to_string();
-                    }
-                    if ui.button("🪨 Apply Thermal Scree Weathering").clicked() {
-                        self.heightmap.simulate_thermal_erosion(4);
-                        self.heightmap_dirty = true;
-                        self.status_message = "Applied 4 cycles of thermal slope breakdown.".to_string();
-                    }
-                    if ui.button("🔄 Invert Heights").clicked() {
-                        for v in &mut self.heightmap.data {
-                            *v = -*v;
-                        }
-                        self.heightmap_dirty = true;
-                        self.status_message = "Inverted terrain (valleys became peaks).".to_string();
-                    }
-                });
+                ui.label("Select a Terrain object (Scene Lab > Add Terrain), then open the Terrain Lab to sculpt it and run hydraulic / thermal erosion passes on its heightmap.");
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -645,7 +610,7 @@ impl EditorState {
             3 => {
                 // Step 4: Sky & Atmosphere
                 ui.heading("Step 4: Sky Lab, Atmospheric Volumetrics & Celestial Dials");
-                ui.label("Bryce's atmosphere is a physical volumetric simulation of light scattering through planetary air:");
+                ui.label("The atmosphere is a physical volumetric simulation of light scattering through planetary air:");
                 ui.label("• Rayleigh Scattering: Wavelength-selective scattering that creates deep azure blue zenith skies and fiery golden/red sunset horizons.\n• Mie Scattering: Aerosol particle scattering producing the intense solar corona glow, flare, and disc halo.\n• Volumetric Fog & Haze: Height-based ground fog and distance atmospheric perspective that provides majestic scale.");
 
                 ui.group(|ui| {
@@ -657,9 +622,9 @@ impl EditorState {
                 ui.label(RichText::new("🌅 Try Atmospheric Presets:").strong());
 
                 ui.horizontal(|ui| {
-                    if ui.button("🌅 Bryce 90s Sunset").clicked() {
-                        scene_ctrl.sky = crate::sky::SkyConfig::bryce_sunset();
-                        self.status_message = "Applied Bryce 90s Sunset sky preset.".to_string();
+                    if ui.button("🌅 Retro 90s Sunset").clicked() {
+                        scene_ctrl.sky = crate::sky::SkyConfig::retro_sunset();
+                        self.status_message = "Applied Retro 90s Sunset sky preset.".to_string();
                     }
                     if ui.button("☀️ Clear Midday").clicked() {
                         scene_ctrl.sky = crate::sky::SkyConfig::clear_blue();
@@ -688,22 +653,22 @@ impl EditorState {
             4 => {
                 // Step 5: Water & Ocean
                 ui.heading("Step 5: Infinite Water Plane & Ocean Physics");
-                ui.label("Water in Bryce is an infinite ocean plane with procedural waves and physical optics:");
+                ui.label("Water here is an infinite ocean plane with procedural waves and physical optics:");
                 ui.label("• Multi-Component Gerstner Waves: Procedural sinusoidal wave displacement with controllable amplitude, frequency, and drift speed.\n• Physical Fresnel Reflections: At shallow grazing angles, water acts as a mirror reflecting the sky and mountains; at perpendicular view angles it reveals seabed depths.\n• Beer-Lambert Extinction: Light absorption causes water to transition naturally from turquoise shallows to deep navy abysses.");
 
                 ui.group(|ui| {
                     ui.label(RichText::new("🌊 Try Ocean Presets:").strong().color(Color32::from_rgb(0, 220, 240)));
                     ui.horizontal(|ui| {
                         if ui.button("🌊 Open Ocean Waves").clicked() {
-                            scene_ctrl.water = crate::water::WaterConfig::ocean();
+                            { let keep_enabled = scene_ctrl.water.enabled; scene_ctrl.water = crate::water::WaterConfig::ocean(); scene_ctrl.water.enabled = keep_enabled; }
                             self.status_message = "Configured Open Ocean with Gerstner waves.".to_string();
                         }
                         if ui.button("🪞 Calm Mirror Glass").clicked() {
-                            scene_ctrl.water = crate::water::WaterConfig::calm_mirror();
+                            { let keep_enabled = scene_ctrl.water.enabled; scene_ctrl.water = crate::water::WaterConfig::calm_mirror(); scene_ctrl.water.enabled = keep_enabled; }
                             self.status_message = "Configured Calm Mirror-like water surface.".to_string();
                         }
                         if ui.button("🧪 Alien Bioluminescent").clicked() {
-                            scene_ctrl.water = crate::water::WaterConfig::alien_liquid();
+                            { let keep_enabled = scene_ctrl.water.enabled; scene_ctrl.water = crate::water::WaterConfig::alien_liquid(); scene_ctrl.water.enabled = keep_enabled; }
                             self.status_message = "Configured Alien Bioluminescent liquid.".to_string();
                         }
                     });
@@ -722,7 +687,7 @@ impl EditorState {
             5 => {
                 // Step 6: Materials & DTE
                 ui.heading("Step 6: Deep Texture Editor (DTE) & 3D Spatial Texturing");
-                ui.label("Bryce revolutionized 3D CGI with the Deep Texture Editor (DTE). Instead of wrapping 2D image textures around objects, DTE materials evaluate continuously in 3D object and world space $(X, Y, Z)$:");
+                ui.label("The Deep Texture Editor (DTE) is the core of Bricius's material system. Instead of wrapping 2D image textures around objects, DTE materials evaluate continuously in 3D object and world space $(X, Y, Z)$:");
                 ui.label("• Zero UV Unwrapping: No texture stretching, pinching at poles, or visible seam lines!\n• Optical Parameters: Base and Secondary color ramps, roughness, metallic, reflectivity (mirror bounces), transparency, and physical Index of Refraction (IOR).\n• Procedural Bump Relief: Surface normal perturbations evaluated via spatial gradient estimation without requiring normal map files.");
 
                 ui.group(|ui| {
@@ -765,7 +730,7 @@ impl EditorState {
             6 => {
                 // Step 7: Scene Objects & CSG
                 ui.heading("Step 7: 3D Scene Composition & CSG Booleans");
-                ui.label("Bryce allows composing intricate geometric forms using 3D primitives and Constructive Solid Geometry (CSG):");
+                ui.label("Bricius allows composing intricate geometric forms using 3D primitives and Constructive Solid Geometry (CSG):");
                 ui.label("• Primitives: Spheres, Cubes, Cylinders, and Toruses with full 3-axis Position, Rotation (Pitch, Yaw, Roll), and Scale.\n• Constructive Solid Geometry (CSG):\n  - Positive (Solid Union): standard solid object.\n  - Negative (Subtractive Cutout): punches physical cavities through solid primitives and terrain, with inverted normals and interior cutter material inheritance!\n  - Intersecting: preserves only the overlapping boolean volume.");
 
                 ui.group(|ui| {
@@ -804,7 +769,7 @@ impl EditorState {
             7 => {
                 // Step 8: Scatter System
                 ui.heading("Step 8: Vegetation & Rock Scatter System");
-                ui.label("Instead of placing hundreds of trees and boulders by hand, Bryce provides an automated procedural scatter system:");
+                ui.label("Instead of placing hundreds of trees and boulders by hand, Bricius provides an automated procedural scatter system:");
                 ui.label("• Altitude Masking: Set min and max elevation to ensure trees only grow in fertile valleys and don't spawn underwater or on snow peaks.\n• Slope Filtering: Restrict scatter to gentler slopes (e.g. max 35°), preventing trees from clinging to vertical sheer cliffs.\n• Density Controls: Independently adjust rock boulder density and pine tree spire density.");
 
                 ui.group(|ui| {
@@ -830,8 +795,8 @@ impl EditorState {
             8 => {
                 // Step 9: Render & Export
                 ui.heading("Step 9: Render Lab, Retro 1990s CGI & Project Export");
-                ui.label("You're ready to render and export your artwork! Bryce supports both modern high-fidelity rendering and authentic retro CGI aesthetics:");
-                ui.label("• Retro 1990s CGI Mode: Emulates the punchy contrast, vibrant saturated color, and 16-bit / 24-bit color quantization of legendary 90s CGI renderers.\n• Render Quality Presets: Interactive Preview, Draft, Standard, High Quality, and Maximum Production.\n• Native Project Serialization: Save and restore entire worlds using human-readable .bryce.json project files.\n• 3D Mesh & Heightmap Export: Export 3D OBJ meshes and PNG elevation maps for external DCC software.");
+                ui.label("You're ready to render and export your artwork! Bricius supports both modern high-fidelity rendering and authentic retro CGI aesthetics:");
+                ui.label("• Retro 1990s CGI Mode: Emulates the punchy contrast, vibrant saturated color, and 16-bit / 24-bit color quantization of legendary 90s CGI renderers.\n• Render Quality Presets: Interactive Preview, Draft, Standard, High Quality, and Maximum Production.\n• Native Project Serialization: Save and restore entire worlds using human-readable .bricius.json project files.\n• 3D Mesh & Heightmap Export: Export 3D OBJ meshes and PNG elevation maps for external DCC software.");
 
                 ui.group(|ui| {
                     ui.label(RichText::new("🎥 Render Lab Quick Actions:").strong().color(Color32::from_rgb(0, 220, 240)));
@@ -841,18 +806,21 @@ impl EditorState {
                             scene_ctrl.postprocess.retro_90s_cgi = !scene_ctrl.postprocess.retro_90s_cgi;
                             self.status_message = format!("Retro 1990s CGI mode set to {}", scene_ctrl.postprocess.retro_90s_cgi);
                         }
-                        if ui.button("💾 Save Project (.bryce.json)").clicked() {
+                        if ui.button("💾 Save Project (.bricius.json)").clicked() {
                             let proj = ProjectFile {
-                                name: "My Bryce Studio World".to_string(),
+                                name: "My Bricius World".to_string(),
                                 version: "7.0.0".to_string(),
                                 terrain: scene_ctrl.terrain.clone(),
                                 sky: scene_ctrl.sky.clone(),
                                 water: scene_ctrl.water.clone(),
+                                ground: scene_ctrl.ground.clone(),
+                                lights: scene_ctrl.lights.clone(),
                                 materials: materials.to_vec(),
                                 objects: objects.clone(),
                                 postprocess: scene_ctrl.postprocess.clone(),
+                                terrain_objects: terrains.iter().map(|t| t.to_save()).collect(),
                             };
-                            let path = "my_bryce_world.bryce.json";
+                            let path = "my_bricius_world.bricius.json";
                             match ProjectIO::save_project(path, &proj) {
                                 Ok(_) => self.status_message = format!("Saved project to {}", path),
                                 Err(e) => self.status_message = format!("Save error: {}", e),
@@ -862,7 +830,7 @@ impl EditorState {
                 });
 
                 ui.add_space(10.0);
-                ui.label(RichText::new("🎉 You are now fully trained in Bryce 7 Pro Studio! Enjoy creating surreal landscapes and photorealistic worlds.").strong().color(Color32::from_rgb(0, 230, 160)));
+                ui.label(RichText::new("🎉 You are now fully trained in Bricius! Enjoy creating surreal landscapes and photorealistic worlds.").strong().color(Color32::from_rgb(0, 230, 160)));
 
                 ui.horizontal(|ui| {
                     if ui.button("🚀 Open Render & Export Lab").clicked() {
@@ -893,7 +861,7 @@ impl EditorState {
         ui.separator();
 
         let themes = [
-            (SceneTheme::ClassicBryce1994, "🏜️ Classic Bryce 1994 Canyon", "Signature eroded red rocks, golden sunset, and floating mirror chrome orb."),
+            (SceneTheme::Classic1994Canyon, "🏜️ Classic 1994 Canyon", "Signature eroded red rocks, golden sunset, and floating mirror chrome orb."),
             (SceneTheme::AlpineFjord, "🏔️ Alpine Fjord & Glacial Lake", "Photorealistic mountain peaks, clear turquoise glacial water, and midday sun."),
             (SceneTheme::AlienPandora, "🪐 Alien World of Pandora", "Bioluminescent spires, purple atmosphere, cyan sun, and floating void ring."),
             (SceneTheme::SaharaOasis, "🐪 Sahara Desert Oasis", "Rolling billow sand dunes, desert haze, ancient altar, and emerald oasis pond."),
@@ -916,8 +884,6 @@ impl EditorState {
                             objects,
                             &mut scene_ctrl.postprocess,
                         );
-                        self.heightmap.generate_from_config(&scene_ctrl.terrain);
-                        self.heightmap_dirty = true;
                         self.status_message = format!("Generated complete world: {}", title);
                     }
                 });
@@ -936,8 +902,6 @@ impl EditorState {
             }
             if ui.button("🎲 Reroll Terrain Only").clicked() {
                 SceneGenerator::reroll_terrain(rand_pseudo_u32(), &mut scene_ctrl.terrain);
-                self.heightmap.generate_from_config(&scene_ctrl.terrain);
-                self.heightmap_dirty = true;
                 self.status_message = "Rerolled terrain geometry.".to_string();
             }
             if ui.button("🎲 Reroll Water Only").clicked() {
@@ -951,13 +915,290 @@ impl EditorState {
     // -------------------------------------------------------------------------
     // TERRAIN LAB & INTERACTIVE SCULPTOR
     // -------------------------------------------------------------------------
-    fn draw_terrain_lab(&mut self, ui: &mut Ui, scene_ctrl: &mut SceneController) {
-        ui.heading("Ken Musgrave Fractal Algorithms");
+    fn draw_terrain_lab(
+        &mut self,
+        ui: &mut Ui,
+        scene_ctrl: &mut SceneController,
+        objects: &mut Vec<SceneObject>,
+        terrains: &mut Vec<TerrainObjectData>,
+        terrain_dirty: &mut bool,
+        camera: &Camera,
+    ) {
+        // Selected terrain object (if any)
+        let sel_obj = if self.selected_object_idx < objects.len()
+            && objects[self.selected_object_idx].primitive == crate::objects::PrimitiveType::Terrain
+        {
+            Some(self.selected_object_idx)
+        } else {
+            None
+        };
+        let sel_tid = sel_obj
+            .and_then(|i| objects[i].terrain_id)
+            .filter(|&t| t < terrains.len());
 
-        let mut algo = scene_ctrl.terrain.algorithm;
+        ui.heading("Terrain Objects");
+        ui.label("Terrains are real scene objects: select one, move/scale/rotate it, and sculpt its heightmap here.");
+        if ui.button("⛰️ Add Terrain").clicked() {
+            self.add_terrain_object(objects, terrains, terrain_dirty, scene_ctrl, camera);
+        }
+
+        let Some(tid) = sel_tid else {
+            ui.add_space(6.0);
+            ui.label(RichText::new("No terrain object selected. Select a Terrain in the Scene Lab (or click it in the viewport), or add a new one above.").color(Color32::from_rgb(240, 190, 90)));
+            self.draw_backdrop_section(ui, scene_ctrl);
+            return;
+        };
+        let obj_name = objects[sel_obj.unwrap()].name.clone();
+        ui.label(RichText::new(format!("Editing: {} (heightmap {}x{})", obj_name, terrains[tid].heightmap.resolution, terrains[tid].heightmap.resolution)).strong().color(Color32::from_rgb(0, 220, 240)));
+
+        // Resolution
+        ui.horizontal(|ui| {
+            ui.label("Resolution:");
+            for r in [128usize, 256, 512] {
+                if ui.selectable_label(terrains[tid].heightmap.resolution == r, format!("{}", r)).clicked()
+                    && terrains[tid].heightmap.resolution != r
+                {
+                    terrains[tid].heightmap.resample(r);
+                    *terrain_dirty = true;
+                    self.heightmap_dirty = true;
+                    self.status_message = format!("Resampled terrain to {}x{}.", r, r);
+                }
+            }
+        });
+
+        ui.separator();
+        ui.heading("Fractal Generator (into selected terrain)");
+        Self::terrain_config_controls(ui, &mut terrains[tid].config, "terrain_obj_cfg");
+        ui.horizontal(|ui| {
+            if ui.button("⚡ Generate into selected terrain").clicked() {
+                let cfg = terrains[tid].config.clone();
+                terrains[tid].heightmap.generate_normalized(&cfg);
+                *terrain_dirty = true;
+                self.heightmap_dirty = true;
+                self.status_message = "Generated heightmap into selected terrain.".to_string();
+            }
+            if ui.button("📋 Copy settings from Backdrop").clicked() {
+                terrains[tid].config = scene_ctrl.terrain.clone();
+                self.status_message = "Copied backdrop fractal settings into the terrain generator.".to_string();
+            }
+        });
+
+        // Keep the 2D preview texture in sync
+        let key = (tid, terrains[tid].heightmap.resolution);
+        if self.heightmap_dirty || self.heightmap_texture.is_none() || self.heightmap_preview_key != Some(key) {
+            let res = terrains[tid].heightmap.resolution;
+            let mut pixels = vec![Color32::BLACK; res * res];
+            for i in 0..res * res {
+                pixels[i] = height_to_hypsometric_color(terrains[tid].heightmap.data[i] * 17.0 - 2.0);
+            }
+            let img = egui::ColorImage::new([res, res], pixels);
+            if let Some(ref mut handle) = self.heightmap_texture {
+                handle.set(img, egui::TextureOptions::LINEAR);
+            } else {
+                self.heightmap_texture = Some(ui.ctx().load_texture("heightmap_preview", img, egui::TextureOptions::LINEAR));
+            }
+            self.heightmap_dirty = false;
+            self.heightmap_preview_key = Some(key);
+        }
+
+        ui.separator();
+        ui.heading("Interactive Heightmap Sculptor Canvas");
+        ui.label("Click & drag directly on the elevation map to sculpt the selected terrain (updates the 3D view live):");
+
+        let canvas_size = 256.0;
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(canvas_size, canvas_size), egui::Sense::click_and_drag());
+
+        if let Some(ref texture) = self.heightmap_texture {
+            ui.painter().image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.5, Color32::from_rgb(65, 75, 95)), egui::StrokeKind::Outside);
+
+        let res = terrains[tid].heightmap.resolution;
+        // Brush radius is expressed in 256-grid cells; scale to the actual resolution
+        let radius_cells = ((self.brush_radius as f32) * res as f32 / 256.0).round().max(1.0) as usize;
+
+        if response.clicked() || response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let rel_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
+                let rel_y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
+                let hx = (rel_x * (res as f32 - 1.0)).round() as usize;
+                let hy = (rel_y * (res as f32 - 1.0)).round() as usize;
+                let t = &mut terrains[tid];
+                t.heightmap.apply_brush(hx, hy, radius_cells, self.brush_strength, self.brush_mode, self.brush_target_height);
+                t.clamp_heights();
+                *terrain_dirty = true;
+                self.heightmap_dirty = true;
+            }
+        }
+
+        if let Some(pos) = response.hover_pos() {
+            let pixel_scale = rect.width() / res as f32;
+            ui.painter().circle_stroke(
+                pos,
+                radius_cells as f32 * pixel_scale,
+                egui::Stroke::new(1.5, Color32::from_rgb(0, 240, 255)),
+            );
+        }
+
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.brush_mode, BrushMode::Raise, "⬆️ Raise");
+            ui.selectable_value(&mut self.brush_mode, BrushMode::Lower, "⬇️ Lower");
+            ui.selectable_value(&mut self.brush_mode, BrushMode::Smooth, "🌊 Smooth");
+            ui.selectable_value(&mut self.brush_mode, BrushMode::Flatten, "⏹️ Flatten");
+            ui.selectable_value(&mut self.brush_mode, BrushMode::Noise, "🎲 Noise");
+        });
+
+        ui.add(Slider::new(&mut self.brush_radius, 2..=32).text("Brush Radius"));
+        ui.add(Slider::new(&mut self.brush_strength, 0.05..=1.5).text("Brush Strength"));
+        if self.brush_mode == BrushMode::Flatten {
+            ui.add(Slider::new(&mut self.brush_target_height, 0.0..=1.0).text("Flatten Target Height (0..1)"));
+        }
+
+        ui.separator();
+        ui.heading("Geological Simulation & Operations");
+        ui.horizontal(|ui| {
+            if ui.button("🌧️ Hydraulic Rain Erosion").clicked() {
+                terrains[tid].heightmap.simulate_hydraulic_erosion(4);
+                terrains[tid].clamp_heights();
+                *terrain_dirty = true;
+                self.heightmap_dirty = true;
+                self.status_message = "Simulated 4 cycles of hydraulic rainfall & sediment deposition.".to_string();
+            }
+            if ui.button("🪨 Thermal Scree Weathering").clicked() {
+                terrains[tid].heightmap.simulate_thermal_erosion(4);
+                terrains[tid].clamp_heights();
+                *terrain_dirty = true;
+                self.heightmap_dirty = true;
+                self.status_message = "Simulated 4 cycles of thermal slope weathering.".to_string();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui.button("🔄 Invert Heights").clicked() {
+                for v in &mut terrains[tid].heightmap.data {
+                    *v = 1.0 - *v;
+                }
+                *terrain_dirty = true;
+                self.heightmap_dirty = true;
+                self.status_message = "Inverted terrain elevations (valleys to ridges).".to_string();
+            }
+            if ui.button("⚖️ Normalize Range").clicked() {
+                let mut min_h = f32::INFINITY;
+                let mut max_h = f32::NEG_INFINITY;
+                for &h in &terrains[tid].heightmap.data {
+                    min_h = min_h.min(h);
+                    max_h = max_h.max(h);
+                }
+                let span = (max_h - min_h).max(0.001);
+                for v in &mut terrains[tid].heightmap.data {
+                    *v = (*v - min_h) / span;
+                }
+                *terrain_dirty = true;
+                self.heightmap_dirty = true;
+                self.status_message = "Normalized terrain elevations to the full [0..1] range.".to_string();
+            }
+            if ui.button("🧹 Clear / Flatten").clicked() {
+                for v in &mut terrains[tid].heightmap.data {
+                    *v = 0.0;
+                }
+                *terrain_dirty = true;
+                self.heightmap_dirty = true;
+                self.status_message = "Cleared terrain to flat plane.".to_string();
+            }
+        });
+
+        ui.separator();
+        ui.heading("Terrain Export (selected terrain)");
+        ui.horizontal(|ui| {
+            if ui.button("💾 Export 3D Mesh (.OBJ)").clicked() {
+                let path = "bricius_terrain.obj";
+                let scale = objects[sel_obj.unwrap()].scale;
+                match terrains[tid].heightmap.export_obj_scaled(path, scale) {
+                    Ok(_) => self.status_message = format!("Exported 3D terrain mesh to {}", path),
+                    Err(e) => self.status_message = format!("Export error: {}", e),
+                }
+            }
+            if ui.button("🖼️ Export Heightmap (.PNG)").clicked() {
+                let path = "bricius_heightmap.png";
+                match terrains[tid].heightmap.export_png(path) {
+                    Ok(_) => self.status_message = format!("Exported elevation heightmap to {}", path),
+                    Err(e) => self.status_message = format!("Export error: {}", e),
+                }
+            }
+        });
+
+        self.draw_backdrop_section(ui, scene_ctrl);
+    }
+
+    /// Highest ground surface under (x, z): backdrop mountains (if enabled) and terrain objects
+    /// (skipping `skip_tid`, the terrain being moved itself).
+    fn ground_height_at(
+        x: f32,
+        z: f32,
+        terrain_objs: &[SceneObject],
+        terrains: &[TerrainObjectData],
+        config: &TerrainConfig,
+        skip_tid: Option<usize>,
+    ) -> f32 {
+        let mut h = if config.backdrop_enabled {
+            crate::terrain::evaluate_procedural_height(x, z, config)
+        } else {
+            f32::NEG_INFINITY
+        };
+        for o in terrain_objs {
+            let Some(tid) = o.terrain_id.filter(|&t| t < terrains.len() && Some(t) != skip_tid) else { continue };
+            let yaw = o.rotation[1].to_radians();
+            let local = glam::Mat3::from_rotation_y(yaw).transpose() * (glam::Vec3::new(x, 0.0, z) - glam::Vec3::new(o.position[0], 0.0, o.position[2]));
+            let u = local.x / o.scale[0].max(1e-4) * 0.5 + 0.5;
+            let v = local.z / o.scale[2].max(1e-4) * 0.5 + 0.5;
+            if (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v) {
+                h = h.max(o.position[1] + terrains[tid].heightmap.sample_bilinear(u, v) * o.scale[1]);
+            }
+        }
+        if h == f32::NEG_INFINITY { 0.0 } else { h }
+    }
+
+    /// Spawn a new terrain object in front of the camera, generated from the current backdrop config
+    pub fn add_terrain_object(
+        &mut self,
+        objects: &mut Vec<SceneObject>,
+        terrains: &mut Vec<TerrainObjectData>,
+        terrain_dirty: &mut bool,
+        scene_ctrl: &SceneController,
+        camera: &Camera,
+    ) {
+        let fwd = camera.forward();
+        let mut pos = [camera.position.x + fwd.x * 28.0, 0.0, camera.position.z + fwd.z * 28.0];
+        pos[1] = scene_ctrl.water.water_height.max(scene_ctrl.ground.height) + 0.0;
+        let tid = terrains.len();
+        terrains.push(TerrainObjectData::new(256, &scene_ctrl.terrain));
+        objects.push(SceneObject::terrain(&format!("Terrain {}", tid + 1), pos, [20.0, 6.0, 20.0], 0, tid));
+        self.selected_object_idx = objects.len() - 1;
+        self.heightmap_dirty = true;
+        *terrain_dirty = true;
+        self.status_message = "Added new Terrain object.".to_string();
+    }
+
+    fn draw_backdrop_section(&mut self, ui: &mut Ui, scene_ctrl: &mut SceneController) {
+        ui.separator();
+        ui.collapsing("🏔️ Backdrop mountains (global procedural terrain)", |ui| {
+            ui.checkbox(&mut scene_ctrl.terrain.backdrop_enabled, "Backdrop mountains enabled");
+            ui.label("Infinite procedural mountains raymarched behind everything. Independent of Terrain objects.");
+            Self::terrain_config_controls(ui, &mut scene_ctrl.terrain, "terrain_backdrop_cfg");
+        });
+    }
+
+    /// Fractal generator controls shared by the backdrop and terrain objects. Returns true if changed.
+    fn terrain_config_controls(ui: &mut Ui, cfg: &mut TerrainConfig, salt: &str) -> bool {
+        let mut algo = cfg.algorithm;
         ui.horizontal(|ui| {
             ui.label("Fractal Algorithm:");
-            egui::ComboBox::from_id_salt("terrain_algo_select")
+            egui::ComboBox::from_id_salt(salt)
                 .selected_text(match algo {
                     TerrainAlgorithm::Fbm => "Fractional Brownian Motion (fBm)",
                     TerrainAlgorithm::RidgedMultifractal => "Ridged Multifractal (Peaks & Canyons)",
@@ -975,154 +1216,20 @@ impl EditorState {
                     ui.selectable_value(&mut algo, TerrainAlgorithm::HybridMultifractal, "Hybrid Multifractal (Smooth to Jagged)");
                 });
         });
-        scene_ctrl.terrain.algorithm = algo;
-
-        let mut changed = false;
-        changed |= ui.add(Slider::new(&mut scene_ctrl.terrain.height_scale, 0.1..=3.0).text("Height Scale")).changed();
-        changed |= ui.add(Slider::new(&mut scene_ctrl.terrain.frequency, 0.01..=0.08).text("Frequency / Scale")).changed();
-        changed |= ui.add(Slider::new(&mut scene_ctrl.terrain.octaves, 1..=6).text("Fractal Octaves")).changed();
-        changed |= ui.add(Slider::new(&mut scene_ctrl.terrain.mountain_sharpness, 0.5..=3.5).text("Mountain Sharpness")).changed();
-        changed |= ui.add(Slider::new(&mut scene_ctrl.terrain.ridge_intensity, 0.5..=3.0).text("Ridge Crest Intensity")).changed();
-        changed |= ui.add(Slider::new(&mut scene_ctrl.terrain.valley_depth, 0.5..=2.5).text("Valley Depth")).changed();
-        changed |= ui.add(Slider::new(&mut scene_ctrl.terrain.domain_warp, 0.0..=2.0).text("Domain Warping")).changed();
-
-        if changed || ui.button("⚡ Sync Heightmap from Fractal Parameters").clicked() {
-            self.heightmap.generate_from_config(&scene_ctrl.terrain);
-            self.heightmap_dirty = true;
-            self.status_message = "Heightmap regenerated from fractal parameters.".to_string();
-        }
-
-        ui.separator();
-        ui.heading("Interactive Heightmap Sculptor Canvas");
-        ui.label("Click & drag directly on the elevation map to sculpt terrain:");
-
-        // Live 2D Heightmap Canvas with Interactive Paint Sculpting
-        let canvas_size = 256.0;
-        let (rect, response) = ui.allocate_exact_size(egui::vec2(canvas_size, canvas_size), egui::Sense::click_and_drag());
-
-        if let Some(ref texture) = self.heightmap_texture {
-            ui.painter().image(
-                texture.id(),
-                rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        }
-
-        // Canvas Border
-        ui.painter().rect_stroke(rect, 0.0, egui::Stroke::new(1.5, Color32::from_rgb(65, 75, 95)), egui::StrokeKind::Outside);
-
-        // Mouse Drag / Click Sculpting
-        if response.clicked() || response.dragged() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let rel_x = ((pos.x - rect.min.x) / rect.width()).clamp(0.0, 1.0);
-                let rel_y = ((pos.y - rect.min.y) / rect.height()).clamp(0.0, 1.0);
-                let res = self.heightmap.resolution;
-                let hx = (rel_x * (res as f32 - 1.0)).round() as usize;
-                let hy = (rel_y * (res as f32 - 1.0)).round() as usize;
-
-                self.heightmap.apply_brush(
-                    hx,
-                    hy,
-                    self.brush_radius,
-                    self.brush_strength,
-                    self.brush_mode,
-                    self.brush_target_height,
-                );
-                self.heightmap_dirty = true;
-            }
-        }
-
-        // Brush Hover Circle Overlay
-        if let Some(pos) = response.hover_pos() {
-            let res = self.heightmap.resolution as f32;
-            let pixel_scale = rect.width() / res;
-            let screen_radius = (self.brush_radius as f32) * pixel_scale;
-            ui.painter().circle_stroke(
-                pos,
-                screen_radius,
-                egui::Stroke::new(1.5, Color32::from_rgb(0, 240, 255)),
-            );
-        }
-
+        let mut changed = algo != cfg.algorithm;
+        cfg.algorithm = algo;
+        changed |= ui.add(Slider::new(&mut cfg.height_scale, 0.1..=3.0).text("Height Scale")).changed();
+        changed |= ui.add(Slider::new(&mut cfg.frequency, 0.01..=0.08).text("Frequency / Scale")).changed();
+        changed |= ui.add(Slider::new(&mut cfg.octaves, 1..=6).text("Fractal Octaves")).changed();
+        changed |= ui.add(Slider::new(&mut cfg.mountain_sharpness, 0.5..=3.5).text("Mountain Sharpness")).changed();
+        changed |= ui.add(Slider::new(&mut cfg.ridge_intensity, 0.5..=3.0).text("Ridge Crest Intensity")).changed();
+        changed |= ui.add(Slider::new(&mut cfg.valley_depth, 0.5..=2.5).text("Valley Depth")).changed();
+        changed |= ui.add(Slider::new(&mut cfg.domain_warp, 0.0..=2.0).text("Domain Warping")).changed();
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.brush_mode, BrushMode::Raise, "⬆️ Raise");
-            ui.selectable_value(&mut self.brush_mode, BrushMode::Lower, "⬇️ Lower");
-            ui.selectable_value(&mut self.brush_mode, BrushMode::Smooth, "🌊 Smooth");
-            ui.selectable_value(&mut self.brush_mode, BrushMode::Flatten, "⏹️ Flatten");
-            ui.selectable_value(&mut self.brush_mode, BrushMode::Noise, "🎲 Noise");
+            ui.label("Seed:");
+            changed |= ui.add(egui::DragValue::new(&mut cfg.seed).speed(1.0)).changed();
         });
-
-        ui.add(Slider::new(&mut self.brush_radius, 2..=32).text("Brush Radius"));
-        ui.add(Slider::new(&mut self.brush_strength, 0.05..=1.5).text("Brush Strength"));
-        if self.brush_mode == BrushMode::Flatten {
-            ui.add(Slider::new(&mut self.brush_target_height, -5.0..=25.0).text("Flatten Target Height"));
-        }
-
-        ui.separator();
-        ui.heading("Geological Simulation & Operations");
-        ui.horizontal(|ui| {
-            if ui.button("🌧️ Hydraulic Rain Erosion").clicked() {
-                self.heightmap.simulate_hydraulic_erosion(4);
-                self.heightmap_dirty = true;
-                self.status_message = "Simulated 4 cycles of hydraulic rainfall & sediment deposition.".to_string();
-            }
-            if ui.button("🪨 Thermal Scree Weathering").clicked() {
-                self.heightmap.simulate_thermal_erosion(4);
-                self.heightmap_dirty = true;
-                self.status_message = "Simulated 4 cycles of thermal slope weathering.".to_string();
-            }
-        });
-
-        ui.horizontal(|ui| {
-            if ui.button("🔄 Invert Heights").clicked() {
-                for v in &mut self.heightmap.data {
-                    *v = -*v;
-                }
-                self.heightmap_dirty = true;
-                self.status_message = "Inverted terrain elevations (valleys to ridges).".to_string();
-            }
-            if ui.button("⚖️ Normalize Range").clicked() {
-                let mut min_h = f32::INFINITY;
-                let mut max_h = f32::NEG_INFINITY;
-                for &h in &self.heightmap.data {
-                    min_h = min_h.min(h);
-                    max_h = max_h.max(h);
-                }
-                let span = (max_h - min_h).max(0.001);
-                for v in &mut self.heightmap.data {
-                    *v = (*v - min_h) / span * 15.0 - 2.0;
-                }
-                self.heightmap_dirty = true;
-                self.status_message = "Normalized terrain elevations to [ -2.0 .. 13.0 ].".to_string();
-            }
-            if ui.button("🧹 Clear / Flatten").clicked() {
-                for v in &mut self.heightmap.data {
-                    *v = 0.0;
-                }
-                self.heightmap_dirty = true;
-                self.status_message = "Cleared terrain to flat plane.".to_string();
-            }
-        });
-
-        ui.separator();
-        ui.heading("Terrain Export");
-        ui.horizontal(|ui| {
-            if ui.button("💾 Export 3D Mesh (.OBJ)").clicked() {
-                let path = "bryce_terrain.obj";
-                match self.heightmap.export_obj(path) {
-                    Ok(_) => self.status_message = format!("Exported 3D terrain mesh to {}", path),
-                    Err(e) => self.status_message = format!("Export error: {}", e),
-                }
-            }
-            if ui.button("🖼️ Export Heightmap (.PNG)").clicked() {
-                let path = "bryce_heightmap.png";
-                match self.heightmap.export_png(path) {
-                    Ok(_) => self.status_message = format!("Exported elevation heightmap to {}", path),
-                    Err(e) => self.status_message = format!("Export error: {}", e),
-                }
-            }
-        });
+        changed
     }
 
     // -------------------------------------------------------------------------
@@ -1176,6 +1283,8 @@ impl EditorState {
     // -------------------------------------------------------------------------
     fn draw_water_lab(&mut self, ui: &mut Ui, scene_ctrl: &mut SceneController) {
         ui.heading("Ocean & Liquid Surface Properties");
+        ui.checkbox(&mut scene_ctrl.water.enabled, "Water plane enabled");
+        ui.checkbox(&mut scene_ctrl.water.animate, "Animate waves (disables progressive accumulation)");
 
         let mut water_type = scene_ctrl.water.water_type;
         ui.horizontal(|ui| {
@@ -1184,21 +1293,21 @@ impl EditorState {
                 .selected_text(match water_type {
                     WaterType::Ocean => "Dynamic Ocean (Gerstner Waves)",
                     WaterType::Lake => "Calm Alpine Lake",
-                    WaterType::CalmMirror => "Bryce 1994 Pure Mirror",
+                    WaterType::CalmMirror => "Retro 1994 Pure Mirror",
                     WaterType::AlienLiquid => "Glowing Alien Liquid",
                 })
                 .show_ui(ui, |ui| {
                     if ui.selectable_value(&mut water_type, WaterType::Ocean, "Dynamic Ocean (Gerstner Waves)").clicked() {
-                        scene_ctrl.water = crate::water::WaterConfig::ocean();
+                        { let keep_enabled = scene_ctrl.water.enabled; scene_ctrl.water = crate::water::WaterConfig::ocean(); scene_ctrl.water.enabled = keep_enabled; }
                     }
                     if ui.selectable_value(&mut water_type, WaterType::Lake, "Calm Alpine Lake").clicked() {
-                        scene_ctrl.water = crate::water::WaterConfig::lake();
+                        { let keep_enabled = scene_ctrl.water.enabled; scene_ctrl.water = crate::water::WaterConfig::lake(); scene_ctrl.water.enabled = keep_enabled; }
                     }
-                    if ui.selectable_value(&mut water_type, WaterType::CalmMirror, "Bryce 1994 Pure Mirror").clicked() {
-                        scene_ctrl.water = crate::water::WaterConfig::calm_mirror();
+                    if ui.selectable_value(&mut water_type, WaterType::CalmMirror, "Retro 1994 Pure Mirror").clicked() {
+                        { let keep_enabled = scene_ctrl.water.enabled; scene_ctrl.water = crate::water::WaterConfig::calm_mirror(); scene_ctrl.water.enabled = keep_enabled; }
                     }
                     if ui.selectable_value(&mut water_type, WaterType::AlienLiquid, "Glowing Alien Liquid").clicked() {
-                        scene_ctrl.water = crate::water::WaterConfig::alien_liquid();
+                        { let keep_enabled = scene_ctrl.water.enabled; scene_ctrl.water = crate::water::WaterConfig::alien_liquid(); scene_ctrl.water.enabled = keep_enabled; }
                     }
                 });
         });
@@ -1310,7 +1419,7 @@ impl EditorState {
                 ("Obsidian", GpuMaterial::basalt_obsidian()),
                 ("Water", GpuMaterial::ocean_water()),
                 ("Bio-Coral", GpuMaterial::alien_bioluminescent()),
-                ("Plastic", GpuMaterial::bryce_plastic()),
+                ("Plastic", GpuMaterial::retro_plastic()),
                 ("Sandstone", GpuMaterial::sandstone()),
                 ("Ice", GpuMaterial::glacial_ice()),
                 ("Wood", GpuMaterial::wood_grain()),
@@ -1435,8 +1544,25 @@ impl EditorState {
         meshes: &mut Vec<crate::model_loader::LoadedMesh>,
         camera: &mut Camera,
         mesh_dirty: &mut bool,
+        terrains: &mut Vec<TerrainObjectData>,
+        terrain_dirty: &mut bool,
     ) {
         ui.heading("3D Scene Composition & Custom Models");
+
+        self.draw_lights_section(ui, scene_ctrl, camera);
+        ui.collapsing("Ground plane", |ui| {
+            ui.checkbox(&mut scene_ctrl.ground.enabled, "Ground plane enabled");
+            ui.add(Slider::new(&mut scene_ctrl.ground.height, -20.0..=20.0).text("Ground height"));
+            let gid = (scene_ctrl.ground.material_id as usize).min(GpuMaterial::NUM_PRESETS - 1);
+            egui::ComboBox::from_id_salt("ground_mat_select")
+                .selected_text(format!("Slot {}: {}", gid, self.material_names[gid]))
+                .show_ui(ui, |ui| {
+                    for m_i in 0..GpuMaterial::NUM_PRESETS {
+                        ui.selectable_value(&mut scene_ctrl.ground.material_id, m_i as u32, format!("Slot {}: {}", m_i, self.material_names[m_i]));
+                    }
+                });
+        });
+        ui.separator();
 
         ui.label(RichText::new("➕ Create Geometric Primitives:").strong());
         ui.horizontal(|ui| {
@@ -1464,6 +1590,9 @@ impl EditorState {
                 self.selected_object_idx = objects.len() - 1;
                 self.status_message = "Added new Torus primitive.".to_string();
             }
+            if ui.button("⛰️ Add Terrain").clicked() {
+                self.add_terrain_object(objects, terrains, terrain_dirty, scene_ctrl, camera);
+            }
         });
 
         ui.separator();
@@ -1474,9 +1603,9 @@ impl EditorState {
                 let spawn_z = camera.position.z + camera.forward().z * 6.0;
                 let ground_y = crate::terrain::evaluate_procedural_height(spawn_x, spawn_z, &scene_ctrl.terrain);
                 let spawn_y = ground_y + 1.8;
-                objects.push(SceneObject::mesh("Bryce Utah Teapot", [spawn_x, spawn_y, spawn_z], [1.5, 1.5, 1.5], scene_ctrl.selected_material, 0));
+                objects.push(SceneObject::mesh("Utah Teapot", [spawn_x, spawn_y, spawn_z], [1.5, 1.5, 1.5], scene_ctrl.selected_material, 0));
                 self.selected_object_idx = objects.len() - 1;
-                self.status_message = "Spawned Bryce Utah Teapot model".to_string();
+                self.status_message = "Spawned Utah Teapot model".to_string();
             }
             if ui.button("🏛️ Desert Monolith").clicked() {
                 let spawn_x = camera.position.x + camera.forward().x * 7.0;
@@ -1580,6 +1709,11 @@ impl EditorState {
         ui.separator();
         ui.label(RichText::new("Scene Objects & Hierarchy").strong());
 
+        let terrain_objs: Vec<SceneObject> = objects
+            .iter()
+            .filter(|o| o.primitive == crate::objects::PrimitiveType::Terrain && o.visible)
+            .cloned()
+            .collect();
         for (i, obj) in objects.iter_mut().enumerate() {
             let is_sel = self.selected_object_idx == i;
             ui.horizontal(|ui| {
@@ -1637,8 +1771,8 @@ impl EditorState {
                         ui.add(egui::DragValue::new(&mut obj.position[1]).speed(0.1).prefix("Y: "));
                         ui.add(egui::DragValue::new(&mut obj.position[2]).speed(0.1).prefix("Z: "));
                         if ui.button("🌱 Snap to Ground").clicked() {
-                            let h = crate::terrain::evaluate_procedural_height(obj.position[0], obj.position[2], &scene_ctrl.terrain);
-                            obj.position[1] = h + obj.scale[1];
+                            let h = Self::ground_height_at(obj.position[0], obj.position[2], &terrain_objs, terrains, &scene_ctrl.terrain, obj.terrain_id);
+                            obj.position[1] = h + if obj.primitive == crate::objects::PrimitiveType::Terrain { 0.0 } else { obj.scale[1] };
                             self.status_message = format!("Snapped '{}' to terrain ground height {:.2}", obj.name, obj.position[1]);
                         }
                     });
@@ -1679,6 +1813,12 @@ impl EditorState {
                     let mut cloned = objects[self.selected_object_idx].clone();
                     cloned.name = format!("{} (Copy)", cloned.name);
                     cloned.position[0] += 2.0;
+                    if let Some(tid) = cloned.terrain_id.filter(|&t| t < terrains.len()) {
+                        let copy = terrains[tid].clone();
+                        terrains.push(copy);
+                        cloned.terrain_id = Some(terrains.len() - 1);
+                        *terrain_dirty = true;
+                    }
                     objects.push(cloned);
                     self.selected_object_idx = objects.len() - 1;
                     self.status_message = "Duplicated selected object.".to_string();
@@ -1723,7 +1863,9 @@ impl EditorState {
         scene_ctrl: &mut SceneController,
         camera: &mut Camera,
         materials: &[GpuMaterial; GpuMaterial::NUM_PRESETS],
-        objects: &[SceneObject],
+        objects: &mut Vec<SceneObject>,
+        terrains: &mut Vec<TerrainObjectData>,
+        terrain_dirty: &mut bool,
     ) {
         ui.heading("Render Aesthetics & Production Output");
 
@@ -1738,13 +1880,13 @@ impl EditorState {
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("Render Style Presets:").strong());
-            if ui.button("✨ Smooth Modern Filmic").clicked() {
-                scene_ctrl.postprocess = crate::postprocess::PostProcessConfig::photorealistic_preset();
-                self.status_message = "Applied Smooth Modern Filmic preset (High 32-bit precision, no quantization).".to_string();
+            if ui.button("Classic '90s (Bryce 4)").clicked() {
+                scene_ctrl.postprocess.apply_look_preset(crate::postprocess::PostProcessConfig::classic_90s_preset());
+                self.status_message = "Applied Classic '90s look (retro grade, hard shadows, 4 bounces).".to_string();
             }
-            if ui.button("💾 Retro 1990s Bryce").clicked() {
-                scene_ctrl.postprocess = crate::postprocess::PostProcessConfig::retro_bryce_preset();
-                self.status_message = "Applied Retro 1990s Bryce preset (Vibrant, high saturation, 90s aesthetic).".to_string();
+            if ui.button("Modern 2000s (Bryce 7)").clicked() {
+                scene_ctrl.postprocess.apply_look_preset(crate::postprocess::PostProcessConfig::modern_2000s_preset());
+                self.status_message = "Applied Modern 2000s look (filmic, soft shadows, bloom).".to_string();
             }
         });
 
@@ -1761,11 +1903,41 @@ impl EditorState {
                 });
         });
 
-        ui.checkbox(&mut scene_ctrl.postprocess.retro_90s_cgi, "💾 Retro 1990s Bryce CGI Mode (Vibrant midtones & synthetic grading)");
+        ui.checkbox(&mut scene_ctrl.postprocess.retro_90s_cgi, "💾 Retro 1990s CGI Mode (Vibrant midtones & synthetic grading)");
 
         ui.add(Slider::new(&mut scene_ctrl.postprocess.contrast, 0.8..=1.8).text("Contrast"));
         ui.add(Slider::new(&mut scene_ctrl.postprocess.saturation, 0.5..=2.0).text("Saturation"));
         ui.add(Slider::new(&mut scene_ctrl.postprocess.bloom_intensity, 0.0..=1.5).text("Bloom Glow"));
+        ui.add(Slider::new(&mut scene_ctrl.postprocess.chromatic_aberration, 0.0..=0.01).text("Chromatic aberration"));
+        ui.add(Slider::new(&mut scene_ctrl.postprocess.vignette_strength, 0.0..=1.0).text("Vignette"));
+        ui.checkbox(&mut scene_ctrl.postprocess.dither_16bit, "16-bit (5-6-5) ordered dither");
+
+        ui.separator();
+        ui.label(RichText::new("Ray Tracing").strong());
+        ui.add(Slider::new(&mut scene_ctrl.postprocess.max_reflection_bounces, 1..=8).text("Max bounces"));
+        ui.checkbox(&mut scene_ctrl.postprocess.soft_shadows, "Soft shadows (sun disc)");
+        if scene_ctrl.postprocess.soft_shadows {
+            ui.add(Slider::new(&mut scene_ctrl.postprocess.sun_angular_radius_deg, 0.1..=5.0).text("Sun size (deg)"));
+        }
+        ui.checkbox(&mut scene_ctrl.postprocess.blurry_reflections, "Blurry reflections (by material roughness)");
+
+        ui.separator();
+        ui.label(RichText::new("Still Render (F9)").strong());
+        ui.horizontal(|ui| {
+            ui.label("Resolution:");
+            ui.add(egui::DragValue::new(&mut scene_ctrl.postprocess.render_width).range(64..=8192).speed(8.0));
+            ui.label("x");
+            ui.add(egui::DragValue::new(&mut scene_ctrl.postprocess.render_height).range(64..=8192).speed(8.0));
+        });
+        ui.horizontal(|ui| {
+            for (w, h) in [(640u32, 480u32), (1024, 768), (1920, 1080)] {
+                if ui.button(format!("{}x{}", w, h)).clicked() {
+                    scene_ctrl.postprocess.render_width = w;
+                    scene_ctrl.postprocess.render_height = h;
+                }
+            }
+        });
+        ui.add(Slider::new(&mut scene_ctrl.postprocess.still_samples, 1..=1024).logarithmic(true).text("Still samples"));
 
         ui.separator();
         ui.heading("Camera System");
@@ -1778,32 +1950,49 @@ impl EditorState {
         ui.separator();
         ui.heading("Project File Management");
         ui.horizontal(|ui| {
-            if ui.button("💾 Save Native Project (.json)").clicked() {
+            if ui.button("💾 Save Native Project (.bricius.json)").clicked() {
                 let project = ProjectFile {
-                    name: "Bryce Modern Studio Project".to_string(),
+                    name: "Bricius Studio Project".to_string(),
                     version: "1.0.0".to_string(),
                     terrain: scene_ctrl.terrain.clone(),
                     sky: scene_ctrl.sky.clone(),
                     water: scene_ctrl.water.clone(),
+                    ground: scene_ctrl.ground.clone(),
+                                lights: scene_ctrl.lights.clone(),
                     materials: materials.to_vec(),
                     objects: objects.to_vec(),
                     postprocess: scene_ctrl.postprocess.clone(),
+                    terrain_objects: terrains.iter().map(|t| t.to_save()).collect(),
                 };
-                match ProjectIO::save_project("bryce_project.json", &project) {
-                    Ok(_) => self.status_message = "Successfully saved project to bryce_project.json".to_string(),
+                match ProjectIO::save_project("bricius_project.bricius.json", &project) {
+                    Ok(_) => self.status_message = "Successfully saved project to bricius_project.bricius.json".to_string(),
                     Err(e) => self.status_message = format!("Save error: {}", e),
                 }
             }
 
             if ui.button("📂 Load Project (.json)").clicked() {
-                match ProjectIO::load_project("bryce_project.json") {
+                // Prefer the current name; fall back to the legacy .bryce.json quick-save.
+                let path = ["bricius_project.bricius.json", "bryce_project.json"]
+                    .into_iter()
+                    .find(|p| std::path::Path::new(p).exists())
+                    .unwrap_or("bricius_project.bricius.json");
+                match ProjectIO::load_project(path) {
                     Ok(proj) => {
                         scene_ctrl.terrain = proj.terrain;
                         scene_ctrl.sky = proj.sky;
                         scene_ctrl.water = proj.water;
+                        scene_ctrl.ground = proj.ground;
+                        scene_ctrl.lights = proj.lights;
                         scene_ctrl.postprocess = proj.postprocess;
-                        self.heightmap.generate_from_config(&scene_ctrl.terrain);
-                        self.status_message = "Successfully loaded bryce_project.json".to_string();
+                        if !proj.terrain_objects.is_empty() {
+                            // Projects with terrain objects restore the object list and heightmaps together
+                            *terrains = proj.terrain_objects.iter().map(TerrainObjectData::from_save).collect();
+                            *objects = proj.objects;
+                            *terrain_dirty = true;
+                            self.heightmap_dirty = true;
+                            self.selected_object_idx = 0;
+                        }
+                        self.status_message = format!("Successfully loaded {}", path);
                     }
                     Err(e) => self.status_message = format!("Load error: {}", e),
                 }
@@ -1812,6 +2001,126 @@ impl EditorState {
     }
 
     /// Draw 3D Transform Gizmo, Selection Brackets, and Orientation Arrows in the Viewport
+    // -------------------------------------------------------------------------
+    // LIGHTS
+    // -------------------------------------------------------------------------
+    fn draw_lights_section(&mut self, ui: &mut Ui, scene_ctrl: &mut SceneController, camera: &Camera) {
+        let header = format!("Lights ({}/{})", scene_ctrl.lights.len(), MAX_LIGHTS);
+        egui::CollapsingHeader::new(header).id_salt("lights_section").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for kind in [LightKind::Point, LightKind::Spot, LightKind::Parallel] {
+                    let can_add = scene_ctrl.lights.len() < MAX_LIGHTS;
+                    if ui.add_enabled(can_add, egui::Button::new(format!("+ {}", kind.label()))).clicked() {
+                        let pos = camera.position + camera.forward() * 8.0;
+                        let mut light = LightConfig::new(kind, [pos.x, pos.y + 1.0, pos.z]);
+                        light.name = format!("{} {}", kind.label(), scene_ctrl.lights.len() + 1);
+                        scene_ctrl.lights.push(light);
+                        self.selected_light_idx = scene_ctrl.lights.len() - 1;
+                        self.status_message = format!("Added {} light.", kind.label());
+                    }
+                }
+            });
+
+            let mut delete_idx: Option<usize> = None;
+            for i in 0..scene_ctrl.lights.len() {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut scene_ctrl.lights[i].enabled, "");
+                    let label = format!("{} ({})", scene_ctrl.lights[i].name, scene_ctrl.lights[i].kind.label());
+                    if ui.selectable_label(self.selected_light_idx == i, label).clicked() {
+                        self.selected_light_idx = i;
+                    }
+                    if ui.small_button("Delete").clicked() {
+                        delete_idx = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = delete_idx {
+                scene_ctrl.lights.remove(i);
+                self.selected_light_idx = self.selected_light_idx.min(scene_ctrl.lights.len().saturating_sub(1));
+            }
+
+            if self.selected_light_idx < scene_ctrl.lights.len() {
+                let l = &mut scene_ctrl.lights[self.selected_light_idx];
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut l.name);
+                });
+                egui::ComboBox::from_id_salt("light_kind_select")
+                    .selected_text(l.kind.label())
+                    .show_ui(ui, |ui| {
+                        for kind in [LightKind::Point, LightKind::Spot, LightKind::Parallel] {
+                            ui.selectable_value(&mut l.kind, kind, kind.label());
+                        }
+                    });
+                ui.checkbox(&mut l.enabled, "Enabled");
+                ui.horizontal(|ui| {
+                    ui.label("Color:");
+                    ui.color_edit_button_rgb(&mut l.color);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Intensity:");
+                    ui.add(egui::DragValue::new(&mut l.intensity).range(0.0..=10000.0).speed(0.5));
+                });
+                if l.kind != LightKind::Parallel {
+                    ui.horizontal(|ui| {
+                        ui.label("Position:");
+                        for v in l.position.iter_mut() {
+                            ui.add(egui::DragValue::new(v).speed(0.1));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Range:");
+                        ui.add(egui::DragValue::new(&mut l.range).range(0.5..=1000.0).speed(0.2));
+                    });
+                }
+                if l.kind != LightKind::Point {
+                    ui.horizontal(|ui| {
+                        ui.label("Direction:");
+                        for v in l.direction.iter_mut() {
+                            ui.add(egui::DragValue::new(v).speed(0.02));
+                        }
+                    });
+                }
+                if l.kind == LightKind::Spot {
+                    ui.add(Slider::new(&mut l.spot_angle_deg, 1.0..=89.0).text("Cone angle (deg)"));
+                    ui.add(Slider::new(&mut l.spot_softness, 0.0..=1.0).text("Penumbra softness"));
+                }
+                ui.checkbox(&mut l.cast_shadows, "Cast shadows");
+            }
+        });
+        ui.separator();
+    }
+
+    /// Yellow markers (and direction lines) for enabled lights in the viewport.
+    fn draw_light_markers(&self, ctx: &egui::Context, camera: &Camera, lights: &[LightConfig], screen_w: f32, screen_h: f32) {
+        if lights.is_empty() {
+            return;
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("light_markers")));
+        let yellow = Color32::from_rgb(255, 220, 40);
+        for (i, l) in lights.iter().enumerate().filter(|(_, l)| l.enabled) {
+            let dir = Vec3::from(l.direction).normalize_or_zero();
+            // Parallel lights have no position: anchor the marker a few units in front of the camera
+            let pos = if l.kind == LightKind::Parallel {
+                camera.position + camera.forward() * 10.0 + camera.up() * 3.0
+            } else {
+                Vec3::from(l.position)
+            };
+            let Some(sp) = camera.project_to_screen(pos, screen_w, screen_h) else { continue };
+            let selected = i == self.selected_light_idx;
+            painter.circle_stroke(sp, if selected { 9.0 } else { 7.0 }, egui::Stroke::new(2.0, yellow));
+            painter.circle_filled(sp, 2.5, yellow);
+            painter.text(sp + egui::vec2(11.0, -9.0), egui::Align2::LEFT_CENTER, &l.name, egui::FontId::proportional(12.0), yellow);
+            if l.kind != LightKind::Point {
+                if let Some(ep) = camera.project_to_screen(pos + dir * 2.0, screen_w, screen_h) {
+                    painter.line_segment([sp, ep], egui::Stroke::new(2.0, yellow));
+                    painter.circle_filled(ep, 3.0, yellow);
+                }
+            }
+        }
+    }
+
     pub fn draw_viewport_gizmo(
         &mut self,
         ctx: &egui::Context,

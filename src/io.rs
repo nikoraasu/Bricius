@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Write};
 
+use crate::ground::GroundConfig;
+use crate::light::LightConfig;
 use crate::material::GpuMaterial;
 use crate::objects::SceneObject;
 use crate::postprocess::PostProcessConfig;
@@ -16,9 +18,15 @@ pub struct ProjectFile {
     pub terrain: TerrainConfig,
     pub sky: SkyConfig,
     pub water: WaterConfig,
+    #[serde(default)]
+    pub ground: GroundConfig,
+    #[serde(default)]
+    pub lights: Vec<LightConfig>,
     pub materials: Vec<GpuMaterial>,
     pub objects: Vec<SceneObject>,
     pub postprocess: PostProcessConfig,
+    #[serde(default)]
+    pub terrain_objects: Vec<crate::terrain::TerrainObjectSave>,
 }
 
 pub struct ProjectIO;

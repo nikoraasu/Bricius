@@ -1,7 +1,9 @@
 pub mod camera;
 pub mod editor;
 pub mod generator;
+pub mod ground;
 pub mod io;
+pub mod light;
 pub mod material;
 pub mod model_loader;
 pub mod objects;

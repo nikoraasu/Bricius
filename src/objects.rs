@@ -11,6 +11,7 @@ pub enum PrimitiveType {
     Torus,
     Plane,
     Mesh,
+    Terrain,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +32,8 @@ pub struct SceneObject {
     pub material_id: u32,
     pub visible: bool,
     pub mesh_id: Option<usize>,
+    #[serde(default)]
+    pub terrain_id: Option<usize>,
 }
 
 impl SceneObject {
@@ -45,6 +48,7 @@ impl SceneObject {
             material_id,
             visible: true,
             mesh_id: None,
+            terrain_id: None,
         }
     }
 
@@ -59,6 +63,7 @@ impl SceneObject {
             material_id,
             visible: true,
             mesh_id: None,
+            terrain_id: None,
         }
     }
 
@@ -73,6 +78,7 @@ impl SceneObject {
             material_id,
             visible: true,
             mesh_id: None,
+            terrain_id: None,
         }
     }
 
@@ -87,6 +93,7 @@ impl SceneObject {
             material_id,
             visible: true,
             mesh_id: None,
+            terrain_id: None,
         }
     }
 
@@ -101,6 +108,23 @@ impl SceneObject {
             material_id,
             visible: true,
             mesh_id: Some(mesh_id),
+            terrain_id: None,
+        }
+    }
+
+    /// Terrain object: footprint x,z in [-1,1] * scale.x/scale.z, height [0,1] * scale.y
+    pub fn terrain(name: &str, pos: [f32; 3], scale: [f32; 3], material_id: u32, terrain_id: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            primitive: PrimitiveType::Terrain,
+            csg_op: CsgOp::Positive,
+            position: pos,
+            rotation: [0.0, 0.0, 0.0],
+            scale,
+            material_id,
+            visible: true,
+            mesh_id: None,
+            terrain_id: Some(terrain_id),
         }
     }
 
@@ -125,6 +149,30 @@ impl SceneObject {
 
         let ro_local = inv_rot * (ro - center);
         let rd_local = (inv_rot * rd).normalize();
+
+        // Terrain objects: oriented bounding box (yaw only) in unit-footprint local space
+        if self.primitive == PrimitiveType::Terrain {
+            let yaw = self.rotation[1].to_radians();
+            let inv = glam::Mat3::from_rotation_y(yaw).transpose();
+            let o = inv * (ro - center);
+            let d = inv * rd;
+            let half = glam::Vec3::new(scale.x, scale.y * 0.5, scale.z);
+            let o = o - glam::Vec3::new(0.0, half.y, 0.0);
+            let safe = glam::Vec3::new(
+                if d.x.abs() < 1e-6 { 1e-6 } else { d.x },
+                if d.y.abs() < 1e-6 { 1e-6 } else { d.y },
+                if d.z.abs() < 1e-6 { 1e-6 } else { d.z },
+            );
+            let inv_d = glam::Vec3::ONE / safe;
+            let t0s = (-half - o) * inv_d;
+            let t1s = (half - o) * inv_d;
+            let t_min = t0s.min(t1s).max_element();
+            let t_max = t0s.max(t1s).min_element();
+            if t_max >= t_min.max(0.05) {
+                return Some(t_min.max(0.05));
+            }
+            return None;
+        }
 
         match self.primitive {
             PrimitiveType::Sphere => {
@@ -187,7 +235,7 @@ impl SceneObject {
                 }
                 None
             }
-            PrimitiveType::Mesh | PrimitiveType::Cone | PrimitiveType::Pyramid | PrimitiveType::Plane => {
+            PrimitiveType::Terrain | PrimitiveType::Mesh | PrimitiveType::Cone | PrimitiveType::Pyramid | PrimitiveType::Plane => {
                 // Bounding sphere/box hit test for picking
                 let max_dim = scale.max_element().max(0.5);
                 let b = ro_local.dot(rd_local);

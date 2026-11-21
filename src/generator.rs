@@ -6,7 +6,7 @@ use crate::water::WaterConfig;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SceneTheme {
-    ClassicBryce1994,
+    Classic1994Canyon,
     AlpineFjord,
     AlienPandora,
     SaharaOasis,
@@ -29,7 +29,7 @@ impl SceneGenerator {
         terrain.seed = seed;
 
         match theme {
-            SceneTheme::ClassicBryce1994 => {
+            SceneTheme::Classic1994Canyon => {
                 *terrain = TerrainConfig {
                     seed,
                     algorithm: TerrainAlgorithm::RidgedMultifractal,
@@ -44,10 +44,11 @@ impl SceneGenerator {
                     domain_warp: 0.6,
                     lagoon_radius: 18.0,
                     snow_line: 18.0,
+                    backdrop_enabled: terrain.backdrop_enabled,
                 };
-                *sky = SkyConfig::bryce_sunset();
+                *sky = SkyConfig::retro_sunset();
                 *water = WaterConfig::ocean();
-                *postprocess = PostProcessConfig::retro_bryce_preset();
+                postprocess.apply_look_preset(PostProcessConfig::retro_90s_preset());
 
                 objects.clear();
                 // Iconic central floating chrome sphere
@@ -72,10 +73,11 @@ impl SceneGenerator {
                     domain_warp: 0.2,
                     lagoon_radius: 24.0,
                     snow_line: 10.0,
+                    backdrop_enabled: terrain.backdrop_enabled,
                 };
                 *sky = SkyConfig::clear_blue();
                 *water = WaterConfig::lake();
-                *postprocess = PostProcessConfig::photorealistic_preset();
+                postprocess.apply_look_preset(PostProcessConfig::photorealistic_preset());
 
                 objects.clear();
                 objects.push(SceneObject::sphere("Glacial Core", [0.0, 2.8, -7.0], 1.5, 10));
@@ -96,17 +98,18 @@ impl SceneGenerator {
                     domain_warp: 1.4,
                     lagoon_radius: 16.0,
                     snow_line: 25.0,
+                    backdrop_enabled: terrain.backdrop_enabled,
                 };
                 *sky = SkyConfig::alien_violet();
                 *water = WaterConfig::alien_liquid();
-                *postprocess = PostProcessConfig {
+                postprocess.apply_look_preset(PostProcessConfig {
                     retro_90s_cgi: false,
                     bloom_intensity: 0.85,
                     vignette_strength: 0.30,
                     contrast: 1.15,
                     saturation: 1.40,
                     ..Default::default()
-                };
+                });
 
                 objects.clear();
                 // Bioluminescent alien spires & crystal
@@ -130,6 +133,7 @@ impl SceneGenerator {
                     domain_warp: 0.8,
                     lagoon_radius: 14.0,
                     snow_line: 50.0,
+                    backdrop_enabled: terrain.backdrop_enabled,
                 };
                 let mut s = SkyConfig::clear_blue();
                 s.sun_elevation = 40.0_f32.to_radians();
@@ -140,7 +144,7 @@ impl SceneGenerator {
                 let mut w = WaterConfig::lake();
                 w.shallow_color = [0.10, 0.85, 0.80, 1.0]; // Bright oasis turquoise
                 *water = w;
-                *postprocess = PostProcessConfig::default();
+                postprocess.apply_look_preset(PostProcessConfig::default());
 
                 objects.clear();
                 objects.push(SceneObject::cube("Ancient Temple Altar", [0.0, 1.5, -7.0], [2.0, 1.5, 2.0], 9));
@@ -161,12 +165,13 @@ impl SceneGenerator {
                     domain_warp: 0.5,
                     lagoon_radius: 18.0,
                     snow_line: 30.0,
+                    backdrop_enabled: terrain.backdrop_enabled,
                 };
                 *sky = SkyConfig::dramatic_storm();
                 let mut w = WaterConfig::ocean();
                 w.deep_color = [0.02, 0.03, 0.05, 1.0]; // Dark volcanic lake
                 *water = w;
-                *postprocess = PostProcessConfig::default();
+                postprocess.apply_look_preset(PostProcessConfig::default());
 
                 objects.clear();
                 objects.push(SceneObject::cube("Obsidian Monolith", [0.0, 2.5, -6.5], [1.2, 3.5, 1.2], 5));
@@ -187,10 +192,11 @@ impl SceneGenerator {
                     domain_warp: 0.0,
                     lagoon_radius: 50.0,
                     snow_line: 50.0,
+                    backdrop_enabled: terrain.backdrop_enabled,
                 };
                 *sky = SkyConfig::cyberpunk_neon();
                 *water = WaterConfig::calm_mirror();
-                *postprocess = PostProcessConfig::retro_bryce_preset();
+                postprocess.apply_look_preset(PostProcessConfig::retro_90s_preset());
 
                 objects.clear();
                 // Floating surreal geometric sculptures
@@ -205,7 +211,7 @@ impl SceneGenerator {
     pub fn reroll_sky(seed: u32, sky: &mut SkyConfig) {
         let types = [
             SkyConfig::clear_blue(),
-            SkyConfig::bryce_sunset(),
+            SkyConfig::retro_sunset(),
             SkyConfig::dramatic_storm(),
             SkyConfig::twilight_glow(),
             SkyConfig::starry_night(),

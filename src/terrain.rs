@@ -25,6 +25,13 @@ pub struct TerrainConfig {
     pub domain_warp: f32,
     pub lagoon_radius: f32,
     pub snow_line: f32,
+    /// Global procedural "Backdrop mountains" (raymarched in the shader, independent of terrain objects)
+    #[serde(default = "default_true")]
+    pub backdrop_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for TerrainConfig {
@@ -43,6 +50,7 @@ impl Default for TerrainConfig {
             domain_warp: 0.4,
             lagoon_radius: 18.0,
             snow_line: 14.0,
+            backdrop_enabled: true,
         }
     }
 }
@@ -59,9 +67,18 @@ pub enum BrushMode {
     ErodeThermal,
 }
 
+/// World footprint (full width, units) sampled when generating a terrain object's heightmap
+pub const TERRAIN_GEN_EXTENT: f32 = 60.0;
+/// Height range (world units) that maps to the normalized [0,1] heightmap range at height_scale 1.0
+pub const TERRAIN_GEN_HEIGHT_RANGE: f32 = 14.0;
+
+#[derive(Clone, Debug)]
 pub struct HeightmapGrid {
     pub resolution: usize,
     pub data: Vec<f32>,
+    /// Multiplier applied to brush deltas and erosion thresholds (1.0 = height-in-world-units grids,
+    /// 1/12 for normalized [0,1] terrain-object heightmaps)
+    pub unit: f32,
 }
 
 impl HeightmapGrid {
@@ -69,9 +86,61 @@ impl HeightmapGrid {
         Self {
             resolution,
             data: vec![0.0; resolution * resolution],
+            unit: 1.0,
         }
     }
 
+    /// Generate a normalized [0,1] heightmap covering the footprint [-extent/2, extent/2]^2
+    pub fn generate_normalized(&mut self, config: &TerrainConfig) {
+        let res = self.resolution;
+        let denom = (res as f32 - 1.0).max(1.0);
+        let range = TERRAIN_GEN_HEIGHT_RANGE * config.height_scale.max(0.05);
+        for y in 0..res {
+            for x in 0..res {
+                let wx = (x as f32 / denom - 0.5) * TERRAIN_GEN_EXTENT;
+                let wz = (y as f32 / denom - 0.5) * TERRAIN_GEN_EXTENT;
+                let h = evaluate_procedural_height(wx, wz, config);
+                self.data[y * res + x] = ((h + 2.0) / range).clamp(0.0, 1.0);
+            }
+        }
+        self.unit = 1.0 / 12.0;
+    }
+
+    /// Bilinear height at normalized footprint coords u,v in [0,1]
+    pub fn sample_bilinear(&self, u: f32, v: f32) -> f32 {
+        let res = self.resolution;
+        if res < 2 {
+            return self.data.first().copied().unwrap_or(0.0);
+        }
+        let fx = u.clamp(0.0, 1.0) * (res as f32 - 1.0);
+        let fy = v.clamp(0.0, 1.0) * (res as f32 - 1.0);
+        let x0 = (fx.floor() as usize).min(res - 2);
+        let y0 = (fy.floor() as usize).min(res - 2);
+        let tx = fx - x0 as f32;
+        let ty = fy - y0 as f32;
+        let h = |x: usize, y: usize| self.data[y * res + x];
+        let a = h(x0, y0) + (h(x0 + 1, y0) - h(x0, y0)) * tx;
+        let b = h(x0, y0 + 1) + (h(x0 + 1, y0 + 1) - h(x0, y0 + 1)) * tx;
+        a + (b - a) * ty
+    }
+
+    /// Resample to a new resolution (bilinear)
+    pub fn resample(&mut self, new_res: usize) {
+        if new_res == self.resolution || new_res < 2 {
+            return;
+        }
+        let mut data = vec![0.0; new_res * new_res];
+        let denom = (new_res as f32 - 1.0).max(1.0);
+        for y in 0..new_res {
+            for x in 0..new_res {
+                data[y * new_res + x] = self.sample_bilinear(x as f32 / denom, y as f32 / denom);
+            }
+        }
+        self.resolution = new_res;
+        self.data = data;
+    }
+
+    #[allow(dead_code)]
     pub fn generate_from_config(&mut self, config: &TerrainConfig) {
         let res = self.resolution;
         let center = (res as f32) * 0.5;
@@ -119,10 +188,10 @@ impl HeightmapGrid {
 
                     match mode {
                         BrushMode::Raise => {
-                            self.data[idx] += effect * 2.0;
+                            self.data[idx] += effect * 2.0 * self.unit;
                         }
                         BrushMode::Lower => {
-                            self.data[idx] -= effect * 2.0;
+                            self.data[idx] -= effect * 2.0 * self.unit;
                         }
                         BrushMode::Smooth => {
                             let mut sum = 0.0;
@@ -140,7 +209,7 @@ impl HeightmapGrid {
                             self.data[idx] = current + (target_height - current) * effect;
                         }
                         BrushMode::Noise => {
-                            let n = (pseudo_hash(x as u32, y as u32) - 0.5) * 4.0;
+                            let n = (pseudo_hash(x as u32, y as u32) - 0.5) * 4.0 * self.unit;
                             self.data[idx] += n * effect;
                         }
                         BrushMode::ErodeHydraulic => {
@@ -154,7 +223,7 @@ impl HeightmapGrid {
                             self.data[idx] -= slope * effect * 0.5;
                         }
                         BrushMode::ErodeThermal => {
-                            let talus_threshold = 0.4;
+                            let talus_threshold = 0.4 * self.unit;
                             let mut max_diff: f32 = 0.0;
                             for ny in (y.saturating_sub(1))..=(y + 1).min(res - 1) {
                                 for nx in (x.saturating_sub(1))..=(x + 1).min(res - 1) {
@@ -222,7 +291,7 @@ impl HeightmapGrid {
     /// Full thermal weathering simulation pass (talus slopes)
     pub fn simulate_thermal_erosion(&mut self, iterations: usize) {
         let res = self.resolution;
-        let talus_threshold = 0.5;
+        let talus_threshold = 0.5 * self.unit;
 
         for _ in 0..iterations {
             for y in 1..res - 1 {
@@ -274,12 +343,47 @@ impl HeightmapGrid {
         img.save(path).map_err(|e| format!("Failed to save PNG: {}", e))
     }
 
+    /// Export a normalized terrain-object heightmap as OBJ, scaled to the object's world extents
+    /// (footprint [-sx,sx] x [-sz,sz], height [0,sy]).
+    pub fn export_obj_scaled(&self, path: &str, scale: [f32; 3]) -> Result<(), String> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path).map_err(|e| format!("Failed to create OBJ file: {}", e))?;
+        writeln!(file, "# Bricius - Terrain Object OBJ Export").unwrap();
+        let res = self.resolution;
+        let denom = (res as f32 - 1.0).max(1.0);
+        for y in 0..res {
+            for x in 0..res {
+                let wx = (x as f32 / denom * 2.0 - 1.0) * scale[0];
+                let wz = (y as f32 / denom * 2.0 - 1.0) * scale[2];
+                let wy = self.data[y * res + x] * scale[1];
+                writeln!(file, "v {:.3} {:.3} {:.3}", wx, wy, wz).unwrap();
+            }
+        }
+        for y in 0..res {
+            for x in 0..res {
+                writeln!(file, "vt {:.4} {:.4}", x as f32 / denom, y as f32 / denom).unwrap();
+            }
+        }
+        for y in 0..res - 1 {
+            for x in 0..res - 1 {
+                let i0 = (y * res + x) + 1;
+                let i1 = (y * res + (x + 1)) + 1;
+                let i2 = ((y + 1) * res + (x + 1)) + 1;
+                let i3 = ((y + 1) * res + x) + 1;
+                writeln!(file, "f {}/{} {}/{} {}/{}", i0, i0, i2, i2, i1, i1).unwrap();
+                writeln!(file, "f {}/{} {}/{} {}/{}", i0, i0, i3, i3, i2, i2).unwrap();
+            }
+        }
+        Ok(())
+    }
+
     /// Export heightmap as 3D OBJ mesh file
+    #[allow(dead_code)]
     pub fn export_obj(&self, path: &str) -> Result<(), String> {
         use std::io::Write;
         let mut file = std::fs::File::create(path).map_err(|e| format!("Failed to create OBJ file: {}", e))?;
 
-        writeln!(file, "# Bryce Modern - Procedural Terrain OBJ Export").unwrap();
+        writeln!(file, "# Bricius - Procedural Terrain OBJ Export").unwrap();
         let res = self.resolution;
         let center = (res as f32) * 0.5;
 
@@ -316,6 +420,53 @@ impl HeightmapGrid {
         }
 
         Ok(())
+    }
+}
+
+/// A terrain object's heightmap (normalized [0,1]) plus the generator config that produced it
+#[derive(Clone, Debug)]
+pub struct TerrainObjectData {
+    pub heightmap: HeightmapGrid,
+    pub config: TerrainConfig,
+}
+
+/// Serializable form (heights quantized to 16 bits)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerrainObjectSave {
+    pub resolution: usize,
+    pub config: TerrainConfig,
+    pub heights: Vec<u16>,
+}
+
+impl TerrainObjectData {
+    pub fn new(resolution: usize, config: &TerrainConfig) -> Self {
+        let mut heightmap = HeightmapGrid::new(resolution);
+        heightmap.generate_normalized(config);
+        Self { heightmap, config: config.clone() }
+    }
+
+    pub fn clamp_heights(&mut self) {
+        for v in &mut self.heightmap.data {
+            *v = v.clamp(0.0, 1.0);
+        }
+    }
+
+    pub fn to_save(&self) -> TerrainObjectSave {
+        TerrainObjectSave {
+            resolution: self.heightmap.resolution,
+            config: self.config.clone(),
+            heights: self.heightmap.data.iter().map(|h| (h.clamp(0.0, 1.0) * 65535.0).round() as u16).collect(),
+        }
+    }
+
+    pub fn from_save(save: &TerrainObjectSave) -> Self {
+        let res = save.resolution.max(2);
+        let mut heightmap = HeightmapGrid::new(res);
+        for (i, v) in heightmap.data.iter_mut().enumerate() {
+            *v = save.heights.get(i).copied().unwrap_or(0) as f32 / 65535.0;
+        }
+        heightmap.unit = 1.0 / 12.0;
+        Self { heightmap, config: save.config.clone() }
     }
 }
 

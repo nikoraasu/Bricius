@@ -97,7 +97,7 @@ impl GpuMaterial {
         }
     }
 
-    pub fn bryce_plastic() -> Self {
+    pub fn retro_plastic() -> Self {
         Self {
             base_color: [0.90, 0.15, 0.25, 1.0],
             secondary_color: [1.0, 0.4, 0.5, 1.0],
@@ -187,7 +187,7 @@ impl GpuMaterial {
             Self::basalt_obsidian(),
             Self::ocean_water(),
             Self::alien_bioluminescent(),
-            Self::bryce_plastic(),
+            Self::retro_plastic(),
             Self::sandstone(),
             Self::glacial_ice(),
             Self::wood_grain(),

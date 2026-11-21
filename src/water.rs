@@ -24,7 +24,15 @@ pub struct WaterConfig {
     pub shallow_color: [f32; 4],
     pub foam_intensity: f32,
     pub caustics_strength: f32,
+    /// Animate waves over time (disables progressive accumulation)
+    #[serde(default)]
+    pub animate: bool,
+    /// Render the water plane at all
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for WaterConfig {
     fn default() -> Self {
@@ -49,6 +57,8 @@ impl WaterConfig {
             shallow_color: [0.05, 0.45, 0.55, 1.0], // Turquoise shore
             foam_intensity: 0.45,
             caustics_strength: 0.60,
+            animate: false,
+            enabled: true,
         }
     }
 
@@ -68,6 +78,8 @@ impl WaterConfig {
             shallow_color: [0.10, 0.50, 0.40, 1.0],
             foam_intensity: 0.10,
             caustics_strength: 0.40,
+            animate: false,
+            enabled: true,
         }
     }
 
@@ -79,7 +91,7 @@ impl WaterConfig {
             wave_frequency: 1.0,
             wave_speed: 0.0,
             wave_steepness: 0.0,
-            reflection_strength: 0.98, // Pure Bryce mirror reflection
+            reflection_strength: 0.98, // Pure mirror reflection
             transparency: 0.40,
             ior: 1.333,
             roughness: 0.005,
@@ -87,6 +99,8 @@ impl WaterConfig {
             shallow_color: [0.05, 0.20, 0.35, 1.0],
             foam_intensity: 0.0,
             caustics_strength: 0.0,
+            animate: false,
+            enabled: true,
         }
     }
 
@@ -106,6 +120,8 @@ impl WaterConfig {
             shallow_color: [0.10, 0.95, 0.85, 1.0], // Glowing cyan edges
             foam_intensity: 0.80,
             caustics_strength: 0.90,
+            animate: false,
+            enabled: true,
         }
     }
 }

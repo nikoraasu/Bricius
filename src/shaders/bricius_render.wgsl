@@ -1,5 +1,5 @@
 // =============================================================================
-// BRYCE 7-INSPIRED COMPLETE 3D ENVIRONMENT CREATION STUDIO (WGSL)
+// BRYCE-INSPIRED 3D ENVIRONMENT CREATION STUDIO (WGSL)
 // =============================================================================
 
 struct CameraUniform {
@@ -34,8 +34,29 @@ struct SceneUniform {
     postprocess_params: vec4<f32>,
     // x: time, y: selected_material, z: seed, w: render_mode (0=Full, 1=Reflections, 2=Normals)
     time_and_flags: vec4<f32>,
-    // x: width, y: height, z: frame_count, w: num_active_primitives
+    // x: width, y: height, z: sample_index, w: num_active_primitives
     resolution: vec4<f32>,
+    // x: vignette_strength, y: gamma, z: dither_16bit (1.0 or 0.0), w: surface_is_srgb (1.0 or 0.0)
+    post_params2: vec4<f32>,
+    // x: max_bounces, y: soft_shadows (0/1), z: sun_angular_radius_deg, w: blurry_reflections (0/1)
+    render_params: vec4<f32>,
+    // x: ground_enabled, y: ground_height, z: ground_material_id, w: water_enabled
+    ground_params: vec4<f32>,
+    // x: active light count, y: backdrop mountains enabled (1/0)
+    light_params: vec4<f32>,
+    // x: chromatic_aberration (display only)
+    display_params: vec4<f32>,
+};
+
+struct GpuLight {
+    // xyz: position, w: kind (0: Point, 1: Spot, 2: Parallel)
+    pos_and_kind: vec4<f32>,
+    // xyz: normalized direction, w: range
+    dir_and_range: vec4<f32>,
+    // rgb: color, w: intensity
+    color_intensity: vec4<f32>,
+    // x: cos(outer), y: cos(inner), z: cast_shadows
+    spot_params: vec4<f32>,
 };
 
 struct GpuMaterial {
@@ -72,6 +93,11 @@ struct GpuTriangle {
 @group(0) @binding(2) var<uniform> materials: array<GpuMaterial, 16>;
 @group(0) @binding(3) var<uniform> primitives: array<GpuPrimitive, 32>;
 @group(0) @binding(4) var<storage, read> mesh_triangles: array<GpuTriangle>;
+@group(0) @binding(5) var<uniform> lights: array<GpuLight, 8>;
+// All terrain-object heightmaps concatenated (normalized [0,1], row-major res x res each)
+@group(0) @binding(6) var<storage, read> terrain_heights: array<f32>;
+// Progressive accumulation buffer (linear HDR), read via textureLoad
+@group(1) @binding(0) var accum_tex: texture_2d<f32>;
 
 // Full-screen triangle vertex shader
 struct VertexOutput {
@@ -240,7 +266,8 @@ struct EvaluatedSurface {
 fn evaluate_material(
     mat: GpuMaterial,
     pos: vec3<f32>,
-    geom_normal: vec3<f32>
+    geom_normal: vec3<f32>,
+    hit_dist: f32
 ) -> EvaluatedSurface {
     let roughness = mat.params1.x;
     let metallic = mat.params1.y;
@@ -300,7 +327,7 @@ fn evaluate_material(
         }
 
         let grad = vec3<f32>(p_dx - pattern_val, p_dy - pattern_val, p_dz - pattern_val) / eps;
-        let bump_factor = bump_strength * 0.12;
+        let bump_factor = bump_strength * 0.12 / (1.0 + hit_dist * 0.04);
         perturbed_normal = normalize(geom_normal - grad * bump_factor);
     }
 
@@ -414,7 +441,8 @@ fn terrain_height(xz: vec2<f32>) -> f32 {
     let dist_from_lagoon = length(xz - vec2<f32>(0.0, -18.0));
     let mask = smoothstep(8.0, 38.0, dist_from_lagoon);
 
-    return (mountain - 2.0) * mask;
+    // Clearing floor sits well below the water plane so the two never coincide
+    return mix(-4.0, mountain - 2.0, mask);
 }
 
 fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
@@ -424,6 +452,33 @@ fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
     let h_d = terrain_height(xz - vec2<f32>(0.0, eps));
     let h_u = terrain_height(xz + vec2<f32>(0.0, eps));
     return normalize(vec3<f32>(h_l - h_r, 2.0 * eps, h_d - h_u));
+}
+
+
+// =============================================================================
+// TERRAIN OBJECTS: sculpted heightmaps (local space: x,z in [-1,1], y in [0,1])
+// =============================================================================
+fn tmap_texel(off: u32, res: u32, ix: u32, iz: u32) -> f32 {
+    return terrain_heights[off + iz * res + ix];
+}
+
+// Bilinear height at normalized footprint coords uv in [0,1]
+fn tmap_sample(off: u32, res: u32, uv: vec2<f32>) -> f32 {
+    let f = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * f32(res - 1u);
+    let x0 = min(u32(floor(f.x)), res - 2u);
+    let z0 = min(u32(floor(f.y)), res - 2u);
+    let tx = f.x - f32(x0);
+    let tz = f.y - f32(z0);
+    let h00 = tmap_texel(off, res, x0, z0);
+    let h10 = tmap_texel(off, res, x0 + 1u, z0);
+    let h01 = tmap_texel(off, res, x0, z0 + 1u);
+    let h11 = tmap_texel(off, res, x0 + 1u, z0 + 1u);
+    return mix(mix(h00, h10, tx), mix(h01, h11, tx), tz);
+}
+
+// Local-space height above the heightfield at local position q (q.y is height, 0..1)
+fn tmap_above(off: u32, res: u32, q: vec3<f32>) -> f32 {
+    return q.y - tmap_sample(off, res, q.xz * 0.5 + vec2<f32>(0.5));
 }
 
 // =============================================================================
@@ -458,15 +513,34 @@ struct HitInfo {
 };
 
 fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
+    return intersect_scene_ex(ro, rd, 10.0, true);
+}
+
+// terrain_t0: where the terrain raymarch starts (primary rays skip the near field);
+// use_water: false for shadow rays, which ignore the water plane.
+fn intersect_scene_ex(ro: vec3<f32>, rd: vec3<f32>, terrain_t0: f32, use_water: bool) -> HitInfo {
     var closest: HitInfo;
     closest.hit = false;
     closest.t = 1e6;
     closest.mat_id = 0u;
     closest.is_water = false;
 
+    // 0. Infinite ground plane (seabed when below the water)
+    if (scene.ground_params.x > 0.5 && abs(rd.y) > 0.0001) {
+        let t_ground = (scene.ground_params.y - ro.y) / rd.y;
+        if (t_ground > 0.05 && t_ground < closest.t) {
+            closest.hit = true;
+            closest.t = t_ground;
+            closest.pos = ro + rd * t_ground;
+            closest.normal = vec3<f32>(0.0, 1.0, 0.0);
+            closest.mat_id = min(u32(scene.ground_params.z + 0.5), 15u);
+            closest.is_water = false;
+        }
+    }
+
     // 1. Water Plane (Y = water_params1.x)
     let water_y = scene.water_params1.x;
-    if (abs(rd.y) > 0.0001) {
+    if (use_water && scene.ground_params.w > 0.5 && abs(rd.y) > 0.0001) {
         let t_water = (water_y - ro.y) / rd.y;
         if (t_water > 0.05 && t_water < closest.t) {
             closest.hit = true;
@@ -482,7 +556,9 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
             let ripple_dx = (w1 + w2) * amp * 0.5;
             let ripple_dz = (cos(wp.x * 1.4 + wave_time) + cos(wp.y * 2.2 - wave_time)) * amp * 0.4;
 
-            closest.normal = normalize(vec3<f32>(-ripple_dx, 1.0, -ripple_dz));
+            // Fade ripple amplitude with distance to suppress far-field sparkle
+            let ripple_fade = 1.0 / (1.0 + t_water * 0.04);
+            closest.normal = normalize(vec3<f32>(-ripple_dx * ripple_fade, 1.0, -ripple_dz * ripple_fade));
             closest.mat_id = 6u; // Ocean Water
             closest.is_water = true;
         }
@@ -507,6 +583,82 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
         let ro_local = rotate_z(rotate_y(rotate_x(ro - center, -rad_rot.x), -rad_rot.y), -rad_rot.z);
         let rd_local = rotate_z(rotate_y(rotate_x(rd, -rad_rot.x), -rad_rot.y), -rad_rot.z);
 
+        if (prim_type == 7u) {
+            // TERRAIN OBJECT: march the heightmap in local space (x,z in [-1,1], y in [0,1])
+            let t_off = u32(prim.extra.y + 0.5);
+            let t_res = u32(prim.extra.z + 0.5);
+            if (t_res < 2u) { continue; }
+            let yaw = prim.rot_and_csg.y * 0.0174532925;
+            let inv_s = vec3<f32>(1.0) / max(scale, vec3<f32>(0.0001));
+            let o_l = rotate_y(ro - center, -yaw) * inv_s;
+            let d_l = rotate_y(rd, -yaw) * inv_s;
+
+            // Clip against local AABB [-1,1] x [0,1] x [-1,1]
+            let sd = select(d_l, sign(d_l) * 0.00001, abs(d_l) < vec3<f32>(0.00001));
+            let sd2 = select(sd, vec3<f32>(0.00001), sd == vec3<f32>(0.0));
+            let inv_d = 1.0 / sd2;
+            let b_min = vec3<f32>(-1.0, 0.0, -1.0);
+            let b_max = vec3<f32>(1.0, 1.0, 1.0);
+            let ta = (b_min - o_l) * inv_d;
+            let tb = (b_max - o_l) * inv_d;
+            let t_enter = max(max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z)), 0.05);
+            let t_exit = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
+            if (t_exit <= t_enter || t_enter >= closest.t) { continue; }
+            let t_end = min(t_exit, closest.t);
+
+            let cell = 2.0 / f32(t_res - 1u);
+            let xz_speed = max(length(d_l.xz), 0.0001);
+            let min_dt = 0.5 * cell / xz_speed;
+            var tt = t_enter;
+            var f_prev = tmap_above(t_off, t_res, o_l + d_l * tt);
+            var t_prev = tt;
+            var found = false;
+            var t_hit = 0.0;
+            for (var k = 0; k < 400; k = k + 1) {
+                if (tt >= t_end) { break; }
+                // Adaptive step: bigger while high above the surface
+                tt = min(tt + max(min_dt, max(f_prev, 0.0) * 0.35 / xz_speed), t_end);
+                let f = tmap_above(t_off, t_res, o_l + d_l * tt);
+                if (f < 0.0 && f_prev >= 0.0) {
+                    var lo = t_prev;
+                    var hi = tt;
+                    for (var j = 0; j < 8; j = j + 1) {
+                        let mid = 0.5 * (lo + hi);
+                        if (tmap_above(t_off, t_res, o_l + d_l * mid) < 0.0) { hi = mid; } else { lo = mid; }
+                    }
+                    t_hit = hi;
+                    found = true;
+                    break;
+                }
+                t_prev = tt;
+                f_prev = f;
+            }
+
+            if (found && t_hit > 0.05 && t_hit < closest.t) {
+                let q = o_l + d_l * t_hit;
+                let uv = q.xz * 0.5 + vec2<f32>(0.5);
+                let e = 1.5 * cell * 0.5; // 1.5 cells in uv units
+                let h_l = tmap_sample(t_off, t_res, uv - vec2<f32>(e, 0.0));
+                let h_r = tmap_sample(t_off, t_res, uv + vec2<f32>(e, 0.0));
+                let h_d = tmap_sample(t_off, t_res, uv - vec2<f32>(0.0, e));
+                let h_u = tmap_sample(t_off, t_res, uv + vec2<f32>(0.0, e));
+                // Gradient per local unit (uv spans 0.5 local units per uv unit)
+                let dh_dx = (h_r - h_l) / (2.0 * e) * 0.5;
+                let dh_dz = (h_u - h_d) / (2.0 * e) * 0.5;
+                // Local x = world_x / sx, y_world = sy * h  =>  d(y_world)/d(x_world) = (sy/sx) * dh/dx_l
+                var n_obj = normalize(vec3<f32>(-dh_dx * scale.y / scale.x, 1.0, -dh_dz * scale.y / scale.z));
+                var n_world = rotate_y(n_obj, yaw);
+                if (dot(n_world, rd) > 0.0) { n_world = -n_world; }
+                closest.hit = true;
+                closest.t = t_hit;
+                closest.pos = ro + rd * t_hit;
+                closest.normal = n_world;
+                closest.mat_id = mat_id;
+                closest.is_water = false;
+            }
+            continue;
+        }
+
         if (prim_type == 0u) {
             // SPHERE
             let oc = ro - center;
@@ -515,7 +667,9 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
             let c = dot(oc, oc) - rad * rad;
             let disc = b * b - c;
             if (disc > 0.0) {
-                let t_sph = -b - sqrt(disc);
+                let sq = sqrt(disc);
+                // Near root, or the far root when the ray starts inside the sphere
+                let t_sph = select(-b + sq, -b - sq, -b - sq > 0.05);
                 if (t_sph > 0.05 && t_sph < closest.t) {
                     closest.hit = true;
                     closest.t = t_sph;
@@ -535,12 +689,14 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
             let t_min = max(max(min(t0s.x, t1s.x), min(t0s.y, t1s.y)), min(t0s.z, t1s.z));
             let t_max = min(min(max(t0s.x, t1s.x), max(t0s.y, t1s.y)), max(t0s.z, t1s.z));
 
-            if (t_max >= max(0.05, t_min) && t_min < closest.t) {
+            // Entry hit, or the exit face when the ray starts inside the box
+            let t_cube = select(t_max, t_min, t_min > 0.05);
+            if (t_max >= t_min && t_cube > 0.05 && t_cube < closest.t) {
                 closest.hit = true;
-                closest.t = t_min;
-                closest.pos = ro + rd * t_min;
+                closest.t = t_cube;
+                closest.pos = ro + rd * t_cube;
 
-                let p_local = ro_local + rd_local * t_min;
+                let p_local = ro_local + rd_local * t_cube;
                 var n_local = vec3<f32>(0.0, 1.0, 0.0);
                 if (abs(p_local.x) > scale.x * 0.99) { n_local = vec3<f32>(sign(p_local.x), 0.0, 0.0); }
                 else if (abs(p_local.y) > scale.y * 0.99) { n_local = vec3<f32>(0.0, sign(p_local.y), 0.0); }
@@ -559,7 +715,33 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
             let c = dot(ro_local.xz, ro_local.xz) - rad * rad;
             let disc = b * b - a * c;
 
-            if (disc > 0.0 && a > 0.0001) {
+            let inside_cyl = c < 0.0 && abs(ro_local.y) < half_h;
+            if (inside_cyl) {
+                // Ray starts inside: find the exit through the side wall or a cap
+                var t_exit = 1e6;
+                var n_local = vec3<f32>(0.0, 1.0, 0.0);
+                if (a > 0.0001) {
+                    t_exit = (-b + sqrt(max(disc, 0.0))) / a;
+                    let p_xz = ro_local.xz + rd_local.xz * t_exit;
+                    n_local = normalize(vec3<f32>(p_xz.x, 0.0, p_xz.y));
+                }
+                if (abs(rd_local.y) > 0.0001) {
+                    let cap_y = select(-half_h, half_h, rd_local.y > 0.0);
+                    let t_cap = (cap_y - ro_local.y) / rd_local.y;
+                    if (t_cap < t_exit) {
+                        t_exit = t_cap;
+                        n_local = vec3<f32>(0.0, sign(cap_y), 0.0);
+                    }
+                }
+                if (t_exit > 0.05 && t_exit < closest.t) {
+                    closest.hit = true;
+                    closest.t = t_exit;
+                    closest.pos = ro + rd * t_exit;
+                    closest.normal = normalize(rotate_x(rotate_y(rotate_z(n_local, rad_rot.z), rad_rot.y), rad_rot.x));
+                    closest.mat_id = mat_id;
+                    closest.is_water = false;
+                }
+            } else if (disc > 0.0 && a > 0.0001) {
                 let sqrt_disc = sqrt(disc);
                 let t_side = (-b - sqrt_disc) / a;
                 let y_hit = ro_local.y + rd_local.y * t_side;
@@ -730,22 +912,33 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
     }
 
     // 3. Raymarching Backdrop Fractal Mountain
-    var tm = 10.0;
-    let tm_max = 120.0;
+    var tm = terrain_t0;
+    var t_prev = tm;
+    let tm_max = select(-1.0, 120.0, scene.light_params.y > 0.5); // y: backdrop mountains enabled
     for (var i = 0; i < 75; i = i + 1) {
         if (tm > tm_max || tm >= closest.t) { break; }
         let p = ro + rd * tm;
-        let h = terrain_height(p.xz);
-        let dist_to_surface = p.y - h;
-        if (dist_to_surface < 0.14) {
-            closest.hit = true;
-            closest.t = tm;
-            closest.pos = p;
-            closest.normal = terrain_normal(p.xz);
-            closest.mat_id = 0u; // Mountain Rock
-            closest.is_water = false;
+        let dist_to_surface = p.y - terrain_height(p.xz);
+        if (dist_to_surface < 0.0) {
+            // Crossed the surface: bisect between last outside sample and this one
+            var lo = t_prev;
+            var hi = tm;
+            for (var j = 0; j < 8; j = j + 1) {
+                let mid = 0.5 * (lo + hi);
+                let pm = ro + rd * mid;
+                if (pm.y - terrain_height(pm.xz) < 0.0) { hi = mid; } else { lo = mid; }
+            }
+            if (hi < closest.t) {
+                closest.hit = true;
+                closest.t = hi;
+                closest.pos = ro + rd * hi;
+                closest.normal = terrain_normal(closest.pos.xz);
+                closest.mat_id = 0u; // Mountain Rock
+                closest.is_water = false;
+            }
             break;
         }
+        t_prev = tm;
         tm = tm + max(dist_to_surface * 0.5, 0.35);
     }
 
@@ -753,126 +946,403 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
 }
 
 // =============================================================================
-// MAIN RECURSIVE RAYTRACING SHADER
+// PATH TRACING CORE (iterative: WGSL has no recursion)
 // =============================================================================
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn rnd(s: ptr<function, u32>) -> f32 {
+    *s = pcg_hash(*s);
+    return f32(*s >> 8u) / 16777216.0;
+}
+
+fn rand_unit_vec(s: ptr<function, u32>) -> vec3<f32> {
+    let z = rnd(s) * 2.0 - 1.0;
+    let a = rnd(s) * 6.2831853;
+    let r = sqrt(max(1.0 - z * z, 0.0));
+    return vec3<f32>(r * cos(a), r * sin(a), z);
+}
+
+fn schlick_scalar(f0: f32, c: f32) -> f32 {
+    return f0 + (1.0 - f0) * pow(1.0 - clamp(c, 0.0, 1.0), 5.0);
+}
+
+// Light transmittance along a shadow ray. Opaque hit -> 0, transparent hits tint
+// the light (sqrt(transparency * albedo) per interface, so entering + leaving a
+// closed object gives transparency * albedo). The water plane is ignored.
+// Reusable for point/spot lights by passing a ray towards the light.
+fn shadow_transmittance(p: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
+    return shadow_transmittance_d(p, dir, 1.0e9);
+}
+
+// Same as above, but only occluders closer than max_dist count (point / spot lights)
+fn shadow_transmittance_d(p: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> vec3<f32> {
+    var trans = vec3<f32>(1.0);
+    var origin = p;
+    var left = max_dist;
+    for (var i = 0; i < 4; i = i + 1) {
+        let h = intersect_scene_ex(origin, dir, 0.4, false);
+        if (!h.hit || h.t > left) { break; }
+        let m = materials[h.mat_id];
+        let tr = clamp(m.params1.w, 0.0, 1.0);
+        if (tr < 0.01) { return vec3<f32>(0.0); }
+        trans = trans * sqrt(max(m.base_color.rgb, vec3<f32>(0.0)) * tr);
+        if (max(trans.x, max(trans.y, trans.z)) < 0.01) { return vec3<f32>(0.0); }
+        origin = h.pos + dir * 0.06;
+        left = left - h.t - 0.06;
+    }
+    return trans;
+}
+
+// Sun direction for one shadow sample (jittered inside the solar disc when soft shadows are on)
+fn sun_shadow_dir(sun_dir: vec3<f32>, s: ptr<function, u32>) -> vec3<f32> {
+    if (scene.render_params.y < 0.5) { return sun_dir; }
+    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(sun_dir.y) > 0.99);
+    let t = normalize(cross(up, sun_dir));
+    let b = cross(sun_dir, t);
+    let r = sqrt(rnd(s));
+    let a = rnd(s) * 6.2831853;
+    let spread = tan(radians(scene.render_params.z));
+    return normalize(sun_dir + (t * cos(a) + b * sin(a)) * (r * spread));
+}
+
+fn max3(v: vec3<f32>) -> f32 {
+    return max(v.x, max(v.y, v.z));
+}
+
+fn trace_pixel(uv: vec2<f32>, seed: u32) -> vec3<f32> {
+    var rng = seed;
     let tan_half_fov = camera.params.x;
     let aspect_ratio = camera.params.y;
 
-    let ray_dir = normalize(
+    var rd = normalize(
         camera.forward.xyz +
-        camera.right.xyz * (in.uv.x * tan_half_fov * aspect_ratio) +
-        camera.up.xyz * (in.uv.y * tan_half_fov)
+        camera.right.xyz * (uv.x * tan_half_fov * aspect_ratio) +
+        camera.up.xyz * (uv.y * tan_half_fov)
     );
     var ro = camera.pos.xyz;
-    var rd = ray_dir;
 
     let sun_dir = normalize(scene.sun_direction.xyz);
     let sun_color = scene.sun_color_intensity.rgb * scene.sun_color_intensity.w;
+    let render_mode = u32(scene.time_and_flags.w + 0.5);
+    let max_bounces = clamp(i32(scene.render_params.x + 0.5), 1, 8);
+    let blurry = scene.render_params.w > 0.5;
+    let water_on = scene.ground_params.w > 0.5;
+    let water_y = scene.water_params1.x;
+    let fog_density = scene.fog_params.x;
+    let fog_color = scene.fog_color.rgb;
 
-    let hit = intersect_scene(ro, rd);
+    // Water absorption (Beer-Lambert towards the deep colour) and in-scattered light
+    let water_deep = max(scene.water_deep_color.rgb, vec3<f32>(0.001));
+    let water_sigma = -log(water_deep) * 0.25 * (1.0 - 0.7 * clamp(scene.water_params2.x, 0.0, 1.0));
+    let water_scatter = mix(water_deep, scene.water_shallow_color.rgb, 0.35)
+        * (sun_color * max(sun_dir.y, 0.0) * 0.3 + scene.ground_color.rgb * 0.35);
 
-    if (!hit.hit) {
-        let sky = render_sky(rd, sun_dir);
-        return vec4<f32>(sky, 1.0);
+    var throughput = vec3<f32>(1.0);
+    var radiance = vec3<f32>(0.0);
+    var path_len = 0.0;
+    var alive = false;
+
+    for (var bounce = 0; bounce < 8; bounce = bounce + 1) {
+        if (bounce >= max_bounces) { break; }
+        alive = false;
+        if (max3(throughput) < 0.004) { break; }
+
+        let hit = intersect_scene_ex(ro, rd, select(0.1, 10.0, bounce == 0), true);
+        let seg = select(200.0, hit.t, hit.hit);
+
+        // Participating media along this segment: water below the surface, fog above it
+        let mid_y = ro.y + rd.y * 0.5 * seg;
+        if (water_on && mid_y < water_y) {
+            let tr = exp(-water_sigma * seg);
+            radiance = radiance + throughput * (vec3<f32>(1.0) - tr) * water_scatter;
+            throughput = throughput * tr;
+        } else if (hit.hit) {
+            let tr = exp(-seg * fog_density);
+            radiance = radiance + throughput * fog_color * (1.0 - tr);
+            throughput = throughput * tr;
+        }
+
+        if (!hit.hit) {
+            radiance = radiance + throughput * render_sky(rd, sun_dir);
+            break;
+        }
+
+        if (bounce == 0 && render_mode == 2u) {
+            // Normals Debug Mode
+            return hit.normal * 0.5 + 0.5;
+        }
+
+        path_len = path_len + hit.t;
+        let entering = dot(rd, hit.normal) < 0.0;
+
+        var surf: EvaluatedSurface;
+        var shading_n = hit.normal;
+        var albedo = vec3<f32>(1.0);
+        var roughness = scene.water_params2.z;
+        var transparency = 1.0;
+        var ior = scene.water_params2.y;
+        if (!hit.is_water) {
+            surf = evaluate_material(materials[hit.mat_id], hit.pos, hit.normal, path_len);
+            shading_n = surf.normal;
+            albedo = surf.albedo;
+            roughness = surf.roughness;
+            transparency = surf.transparency;
+            ior = surf.ior;
+        }
+        // Normal facing the incoming ray
+        let n = select(-shading_n, shading_n, dot(shading_n, rd) < 0.0);
+        let cos_i = clamp(dot(-rd, n), 0.0, 1.0);
+
+        // ---- Transparent interface: stochastic Fresnel reflect / refract ----
+        if (hit.is_water || (transparency > 0.01 && rnd(&rng) < transparency)) {
+            let eta = select(ior, 1.0 / ior, entering);
+            let f0 = (ior - 1.0) / (ior + 1.0);
+            let refr = refract(rd, n, eta);
+            let tir = dot(refr, refr) < 0.5;
+            var fres = 1.0;
+            if (!tir) {
+                let cos_t = clamp(dot(refr, -n), 0.0, 1.0);
+                fres = schlick_scalar(f0 * f0, select(cos_t, cos_i, entering));
+                if (hit.is_water) { fres = clamp(fres * scene.water_params2.w, 0.0, 1.0); }
+            }
+            var new_rd: vec3<f32>;
+            if (rnd(&rng) < fres) {
+                new_rd = reflect(rd, n);
+                if (blurry) {
+                    new_rd = normalize(new_rd + rand_unit_vec(&rng) * roughness * 0.6);
+                    new_rd = normalize(new_rd - 2.0 * min(dot(new_rd, n), 0.0) * n);
+                }
+                ro = hit.pos + n * 0.04;
+            } else {
+                new_rd = refr;
+                if (!hit.is_water) { throughput = throughput * sqrt(max(albedo, vec3<f32>(0.0))); }
+                ro = hit.pos - n * 0.04;
+            }
+            rd = new_rd;
+            alive = true;
+            continue;
+        }
+
+        // ---- Opaque shading: sun (hard or soft shadow), ambient, emission ----
+        let n_dot_l = dot(n, sun_dir);
+        var shadow = vec3<f32>(0.0);
+        if (n_dot_l > 0.0) {
+            shadow = shadow_transmittance(hit.pos + n * 0.04, sun_shadow_dir(sun_dir, &rng));
+        }
+        let diffuse = albedo * max(n_dot_l, 0.0) * sun_color;
+        let ambient = albedo * scene.ground_color.rgb * 0.35;
+        let half_vec = normalize(sun_dir - rd);
+        let n_dot_h = max(dot(n, half_vec), 0.0);
+        let spec_power = (1.0 - roughness) * 128.0 + 2.0;
+        let specular = pow(n_dot_h, spec_power) * (1.0 - roughness) * sun_color * surf.reflectivity * shadow;
+        var direct_color = ambient + diffuse * shadow + specular + surf.emission;
+
+        // ---- Extra lights (point / spot / parallel) ----
+        let light_count = min(u32(scene.light_params.x + 0.5), 8u);
+        let spec_gloss = (1.0 - roughness) * surf.reflectivity;
+        for (var li = 0u; li < light_count; li = li + 1u) {
+            let lt = lights[li];
+            let kind = lt.pos_and_kind.w;
+            var l_dir = -lt.dir_and_range.xyz;
+            var atten = 1.0;
+            var l_dist = 1.0e9;
+            if (kind < 1.5) {
+                let to_l = lt.pos_and_kind.xyz - hit.pos;
+                l_dist = max(length(to_l), 0.001);
+                l_dir = to_l / l_dist;
+                let range = lt.dir_and_range.w;
+                let x = l_dist / range;
+                let cutoff = clamp(1.0 - x * x * x * x, 0.0, 1.0);
+                atten = cutoff * cutoff / max(l_dist * l_dist, 0.25);
+                if (kind > 0.5) {
+                    let cd = dot(-l_dir, lt.dir_and_range.xyz);
+                    atten = atten * smoothstep(lt.spot_params.x, max(lt.spot_params.y, lt.spot_params.x + 0.0001), cd);
+                }
+            }
+            let l_n_dot = dot(n, l_dir);
+            if (l_n_dot <= 0.0 || atten < 0.0001) { continue; }
+            var l_shadow = vec3<f32>(1.0);
+            if (lt.spot_params.z > 0.5) {
+                l_shadow = shadow_transmittance_d(hit.pos + n * 0.04, l_dir, l_dist - 0.1);
+            }
+            let l_col = lt.color_intensity.rgb * lt.color_intensity.w * atten * l_shadow;
+            let l_half = normalize(l_dir - rd);
+            let l_spec = pow(max(dot(n, l_half), 0.0), spec_power) * spec_gloss;
+            direct_color = direct_color + albedo * l_n_dot * l_col + l_spec * l_col;
+        }
+
+        // Fresnel-weighted mirror share
+        let f0v = mix(vec3<f32>(0.04), albedo, surf.metallic);
+        let fresnel = f0v + (vec3<f32>(1.0) - f0v) * pow(1.0 - cos_i, 5.0);
+        let refl = clamp(surf.reflectivity * fresnel, vec3<f32>(0.0), vec3<f32>(1.0));
+
+        if (bounce == 0 && render_mode == 1u) {
+            // Specular reflections only
+            return specular + direct_color * surf.reflectivity;
+        }
+
+        radiance = radiance + throughput * direct_color * (vec3<f32>(1.0) - refl);
+        throughput = throughput * refl;
+        if (max3(refl) < 0.02) { break; }
+
+        var new_rd = reflect(rd, n);
+        if (blurry) {
+            new_rd = normalize(new_rd + rand_unit_vec(&rng) * roughness * 0.6);
+            new_rd = normalize(new_rd - 2.0 * min(dot(new_rd, n), 0.0) * n);
+        }
+        rd = new_rd;
+        ro = hit.pos + n * 0.04;
+        alive = true;
     }
+
+    // Bounce budget exhausted with energy left: approximate the remainder with the sky
+    if (alive) {
+        radiance = radiance + throughput * render_sky(rd, sun_dir);
+    }
+    return radiance;
+}
+
+// =============================================================================
+// PROGRESSIVE ACCUMULATION (sub-pixel jittered samples averaged in linear HDR)
+// =============================================================================
+
+fn pcg_hash(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+fn pixel_random(px: vec2<u32>) -> vec2<f32> {
+    let h1 = pcg_hash(px.x + pcg_hash(px.y));
+    let h2 = pcg_hash(h1 ^ 0x9e3779b9u);
+    return vec2<f32>(f32(h1 >> 8u), f32(h2 >> 8u)) / 16777216.0;
+}
+
+@fragment
+fn fs_trace(in: VertexOutput) -> @location(0) vec4<f32> {
+    let px = vec2<u32>(in.clip_position.xy);
+    let sample_index = scene.resolution.z;
+
+    // Per-pixel random offset (Cranley-Patterson rotation) + R2 low-discrepancy sequence
+    let r2 = vec2<f32>(0.7548776662, 0.5698402910);
+    let jitter = fract(pixel_random(px) + r2 * sample_index) - vec2<f32>(0.5);
+    let pixel_ndc = vec2<f32>(2.0) / scene.resolution.xy;
+    let uv = in.uv + jitter * pixel_ndc;
+
+    let seed = pcg_hash(px.x + pcg_hash(px.y + pcg_hash(u32(sample_index) * 9781u + 1u)));
+    var c = trace_pixel(uv, seed);
+    // Guard against NaN/Inf and extreme fireflies poisoning the average
+    if (any(c != c)) { c = vec3<f32>(0.0); }
+    c = clamp(c, vec3<f32>(0.0), vec3<f32>(64.0));
+
+    var result = c;
+    if (sample_index > 0.5) {
+        let prev = textureLoad(accum_tex, vec2<i32>(in.clip_position.xy), 0).rgb;
+        result = mix(prev, c, 1.0 / (sample_index + 1.0));
+    }
+    return vec4<f32>(result, 1.0);
+}
+
+fn bayer4x4(p: vec2<u32>) -> f32 {
+    var m = array<f32, 16>(
+        0.0, 8.0, 2.0, 10.0,
+        12.0, 4.0, 14.0, 6.0,
+        3.0, 11.0, 1.0, 9.0,
+        15.0, 7.0, 13.0, 5.0
+    );
+    let i = (p.y % 4u) * 4u + (p.x % 4u);
+    return (m[i] + 0.5) / 16.0;
+}
+
+fn load_accum(p: vec2<i32>) -> vec3<f32> {
+    let dims = vec2<i32>(textureDimensions(accum_tex));
+    return textureLoad(accum_tex, clamp(p, vec2<i32>(0), dims - vec2<i32>(1)), 0).rgb;
+}
+
+// Soft-knee bright-pass: keeps only the part of the colour above luminance 1.0
+fn bloom_bright(c: vec3<f32>) -> vec3<f32> {
+    let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let knee = 0.5;
+    let soft = clamp(l - 1.0 + knee, 0.0, 2.0 * knee);
+    let soft_c = soft * soft / (4.0 * knee);
+    return c * (max(soft_c, l - 1.0) / max(l, 0.0001));
+}
+
+@fragment
+fn fs_display(in: VertexOutput) -> @location(0) vec4<f32> {
+    let pix = vec2<i32>(in.clip_position.xy);
+    var final_color = load_accum(pix);
 
     let render_mode = u32(scene.time_and_flags.w + 0.5);
-    if (render_mode == 2u) {
-        // Normals Debug Mode
-        return vec4<f32>(hit.normal * 0.5 + 0.5, 1.0);
+    if (render_mode != 0u) {
+        // Debug outputs are shown raw
+        return vec4<f32>(final_color, 1.0);
     }
 
-    let mat = materials[hit.mat_id];
-    let surf = evaluate_material(mat, hit.pos, hit.normal);
+    // Chromatic aberration: R and B sampled with opposite radial offsets
+    let ca = scene.display_params.x;
+    if (ca > 0.00001) {
+        let dims_f = vec2<f32>(textureDimensions(accum_tex));
+        let off = (in.clip_position.xy - dims_f * 0.5) * ca;
+        final_color.r = load_accum(vec2<i32>(floor(in.clip_position.xy + off))).r;
+        final_color.b = load_accum(vec2<i32>(floor(in.clip_position.xy - off))).b;
+    }
 
-    // Direct lighting & specular
-    let n_dot_l = max(dot(surf.normal, sun_dir), 0.0);
-    let diffuse = surf.albedo * n_dot_l * sun_color;
-    let ambient = surf.albedo * scene.ground_color.rgb * 0.35;
-
-    let half_vec = normalize(sun_dir - rd);
-    let n_dot_h = max(dot(surf.normal, half_vec), 0.0);
-    let spec_power = (1.0 - surf.roughness) * 128.0 + 2.0;
-    let specular = pow(n_dot_h, spec_power) * (1.0 - surf.roughness) * sun_color * surf.reflectivity;
-
-    var direct_color = ambient + diffuse + specular + surf.emission;
-
-    // Fresnel reflection
-    let f0 = mix(vec3<f32>(0.04), surf.albedo, surf.metallic);
-    let cos_theta = max(dot(-rd, surf.normal), 0.0);
-    let fresnel = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - cos_theta, 5.0);
-
-    if (hit.is_water) {
-        // Bryce Water: Fresnel reflection + depth extinction
-        let reflect_dir = reflect(rd, surf.normal);
-        let reflected_sky = render_sky(reflect_dir, sun_dir);
-        let water_deep = scene.water_deep_color.rgb;
-        let water_shallow = scene.water_shallow_color.rgb;
-        let water_fresnel = 0.04 + 0.96 * pow(1.0 - cos_theta, 5.0);
-
-        let water_base = mix(water_deep, water_shallow, clamp(surf.normal.y * 0.6, 0.0, 1.0));
-        direct_color = mix(water_base, reflected_sky, water_fresnel * scene.water_params2.w) + specular * 2.0;
-    } else if (surf.reflectivity > 0.05) {
-        // True secondary recursive ray bounce
-        let bounce_ro = hit.pos + surf.normal * 0.03;
-        let bounce_rd = reflect(rd, surf.normal);
-
-        let bounce_hit = intersect_scene(bounce_ro, bounce_rd);
-        var bounce_color: vec3<f32>;
-        if (bounce_hit.hit) {
-            let b_mat = materials[bounce_hit.mat_id];
-            let b_surf = evaluate_material(b_mat, bounce_hit.pos, bounce_hit.normal);
-            let b_ndotl = max(dot(b_surf.normal, sun_dir), 0.0);
-            bounce_color = b_surf.albedo * (b_ndotl * sun_color + vec3<f32>(0.12));
-        } else {
-            bounce_color = render_sky(bounce_rd, sun_dir);
+    // Bloom: sparse 2-ring blur (8 + 8 taps + centre) of the bright-passed HDR
+    let bloom_amount = scene.postprocess_params.y;
+    if (bloom_amount > 0.0001) {
+        let h = f32(textureDimensions(accum_tex).y);
+        let r1 = max(h * 0.006, 1.0);
+        let r2 = max(h * 0.015, 2.0);
+        var acc = bloom_bright(load_accum(pix)) * 2.0;
+        var wsum = 2.0;
+        for (var i = 0; i < 8; i = i + 1) {
+            let a = f32(i) * 0.7853982;
+            let d = vec2<f32>(cos(a), sin(a));
+            acc = acc + bloom_bright(load_accum(pix + vec2<i32>(round(d * r1)))) * 1.5;
+            acc = acc + bloom_bright(load_accum(pix + vec2<i32>(round(d * r2 * 1.0)))) * 1.0;
+            wsum = wsum + 2.5;
         }
-        direct_color = mix(direct_color, bounce_color, surf.reflectivity * fresnel);
+        final_color = final_color + acc / wsum * bloom_amount * 3.0;
     }
-
-    if (render_mode == 1u) {
-        // Specular reflections only
-        return vec4<f32>(specular + direct_color * surf.reflectivity, 1.0);
-    }
-
-    // Atmospheric Distance Fog & Haze
-    let fog_density = scene.fog_params.x;
-    let fog_amount = 1.0 - exp(-hit.t * fog_density);
-    let fog_color = scene.fog_color.rgb;
-    var final_color = mix(direct_color, fog_color, clamp(fog_amount, 0.0, 1.0));
 
     // =========================================================================
-    // POST-PROCESSING LAB (90s Retro CGI Mode, Bloom, Vignette, Grading)
+    // POST-PROCESSING LAB (90s Retro CGI Mode, Grading, Vignette, Gamma)
     // =========================================================================
     let is_retro_90s = scene.postprocess_params.x > 0.5;
-    let bloom_amt = scene.postprocess_params.y;
     let contrast = scene.postprocess_params.z;
     let saturation = scene.postprocess_params.w;
 
     if (is_retro_90s) {
-        // Classic 1990s Bryce vibrant synthetic color characteristics
-        final_color = pow(final_color, vec3<f32>(0.85)); // Punchy midtones
+        // Classic 1990s CGI vibrant synthetic color characteristics
+        final_color = pow(max(final_color, vec3<f32>(0.0)), vec3<f32>(0.85)); // Punchy midtones
         let gray = dot(final_color, vec3<f32>(0.299, 0.587, 0.114));
         final_color = mix(vec3<f32>(gray), final_color, saturation * 1.35); // Super saturated
         final_color = (final_color - 0.5) * (contrast * 1.25) + 0.5;
-        // Subtle color banding/quantization typical of 90s 16/24-bit framebuffers
-        final_color = floor(final_color * 64.0) / 64.0;
+        final_color = max(final_color, vec3<f32>(0.0));
     } else {
         // Modern filmic tone mapping
         let gray = dot(final_color, vec3<f32>(0.299, 0.587, 0.114));
         final_color = mix(vec3<f32>(gray), final_color, saturation);
-        final_color = (final_color - 0.5) * contrast + 0.5;
+        final_color = max((final_color - 0.5) * contrast + 0.5, vec3<f32>(0.0));
         final_color = final_color / (final_color + vec3<f32>(1.0));
-        final_color = pow(max(final_color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
     }
+
+    // Gamma encode exactly once (skipped when the surface is an sRGB format,
+    // where the hardware performs the encode)
+    let gamma = select(max(scene.post_params2.y, 0.1), 1.0, scene.post_params2.w > 0.5);
+    final_color = pow(final_color, vec3<f32>(1.0 / gamma));
 
     // Vignette
     let uv_dist = length(in.uv * 0.7);
-    let vignette = clamp(1.0 - uv_dist * 0.45, 0.0, 1.0);
+    let vignette = clamp(1.0 - uv_dist * scene.post_params2.x * 1.8, 0.0, 1.0);
     final_color = final_color * vignette;
+
+    // Optional ordered dither to 5-6-5 (16-bit) levels
+    if (scene.post_params2.z > 0.5) {
+        let t = bayer4x4(vec2<u32>(in.clip_position.xy));
+        let levels = vec3<f32>(31.0, 63.0, 31.0);
+        final_color = floor(clamp(final_color, vec3<f32>(0.0), vec3<f32>(1.0)) * levels + vec3<f32>(t)) / levels;
+    }
 
     return vec4<f32>(final_color, 1.0);
 }

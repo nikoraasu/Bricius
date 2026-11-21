@@ -1,3 +1,5 @@
+use crate::ground::GroundConfig;
+use crate::light::LightConfig;
 use crate::postprocess::PostProcessConfig;
 use crate::sky::SkyConfig;
 use crate::terrain::TerrainConfig;
@@ -39,8 +41,18 @@ pub struct SceneUniform {
     pub postprocess_params: [f32; 4],
     // x: time, y: selected_material, z: seed, w: render_mode
     pub time_and_flags: [f32; 4],
-    // x: width, y: height, z: frame_count, w: num_active_primitives
+    // x: width, y: height, z: sample_index, w: num_active_primitives
     pub resolution: [f32; 4],
+    // x: vignette_strength, y: gamma, z: dither_16bit (1.0 or 0.0), w: surface_is_srgb (1.0 or 0.0)
+    pub post_params2: [f32; 4],
+    // x: max_bounces, y: soft_shadows (0/1), z: sun_angular_radius_deg, w: blurry_reflections (0/1)
+    pub render_params: [f32; 4],
+    // x: ground_enabled, y: ground_height, z: ground_material_id, w: water_enabled
+    pub ground_params: [f32; 4],
+    // x: active light count, yzw: unused
+    pub light_params: [f32; 4],
+    // x: chromatic_aberration, yzw: unused (display-only, does not reset accumulation)
+    pub display_params: [f32; 4],
 }
 
 #[repr(C)]
@@ -69,6 +81,8 @@ pub struct SceneController {
     pub terrain: TerrainConfig,
     pub sky: SkyConfig,
     pub water: WaterConfig,
+    pub ground: GroundConfig,
+    pub lights: Vec<LightConfig>,
     pub postprocess: PostProcessConfig,
     pub selected_material: u32,
     pub render_mode: u32,
@@ -80,6 +94,8 @@ impl SceneController {
             terrain: TerrainConfig::default(),
             sky: SkyConfig::default(),
             water: WaterConfig::default(),
+            ground: GroundConfig::default(),
+            lights: Vec::new(),
             postprocess: PostProcessConfig::default(),
             selected_material: 1,
             render_mode: 0,

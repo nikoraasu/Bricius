@@ -1,13 +1,13 @@
 use std::fs;
-use bryce_modern::terrain::{
+use bricius::terrain::{
     BrushMode, HeightmapGrid, TerrainAlgorithm, TerrainConfig,
 };
-use bryce_modern::material::GpuMaterial;
-use bryce_modern::objects::{SceneObject, ScatterSystem};
-use bryce_modern::sky::SkyConfig;
-use bryce_modern::water::WaterConfig;
-use bryce_modern::postprocess::PostProcessConfig;
-use bryce_modern::io::{ProjectFile, ProjectIO};
+use bricius::material::GpuMaterial;
+use bricius::objects::{SceneObject, ScatterSystem};
+use bricius::sky::SkyConfig;
+use bricius::water::WaterConfig;
+use bricius::postprocess::PostProcessConfig;
+use bricius::io::{ProjectFile, ProjectIO};
 
 #[test]
 fn test_all_fractal_algorithms() {
@@ -167,21 +167,24 @@ fn test_scatter_system() {
 
 #[test]
 fn test_project_save_load_roundtrip() {
-    let test_path = "target/test_project.bryce.json";
+    let test_path = "target/test_project.bricius.json";
     let _ = fs::remove_file(test_path);
 
     let mut project = ProjectFile {
-        name: "Test Bryce Project".to_string(),
+        name: "Test Bricius Project".to_string(),
         version: "7.0.0".to_string(),
         terrain: TerrainConfig::default(),
-        sky: SkyConfig::bryce_sunset(),
+        sky: SkyConfig::retro_sunset(),
         water: WaterConfig::ocean(),
+        ground: Default::default(),
+        lights: Vec::new(),
         postprocess: PostProcessConfig::default(),
         objects: vec![
             SceneObject::sphere("Chrome Sphere", [0.0, 5.0, 0.0], 2.5, 2),
             SceneObject::torus("Golden Ring", [0.0, 7.0, 0.0], 4.0, 0.6, 4),
         ],
         materials: vec![GpuMaterial::rock(), GpuMaterial::chrome()],
+        terrain_objects: Vec::new(),
     };
 
     project.terrain.height_scale = 2.45;
@@ -204,7 +207,7 @@ fn test_project_save_load_roundtrip() {
 
 #[test]
 fn test_camera_drag_rotation() {
-    use bryce_modern::camera::Camera;
+    use bricius::camera::Camera;
     use glam::Vec3;
 
     let mut camera = Camera::new(Vec3::new(0.0, 5.0, 10.0), -90.0, 0.0);
@@ -224,8 +227,8 @@ fn test_camera_drag_rotation() {
 
 #[test]
 fn test_render_presets_and_request() {
-    use bryce_modern::editor::EditorState;
-    use bryce_modern::postprocess::PostProcessConfig;
+    use bricius::editor::EditorState;
+    use bricius::postprocess::PostProcessConfig;
 
     let mut editor = EditorState::new();
     assert_eq!(editor.request_render, false);
@@ -234,7 +237,7 @@ fn test_render_presets_and_request() {
     editor.request_render = true;
     assert_eq!(editor.request_render, true);
 
-    let retro = PostProcessConfig::retro_bryce_preset();
+    let retro = PostProcessConfig::retro_90s_preset();
     assert!(retro.retro_90s_cgi);
     assert_eq!(retro.contrast, 1.25);
 
@@ -245,11 +248,11 @@ fn test_render_presets_and_request() {
 
 #[test]
 fn test_model_obj_and_presets() {
-    use bryce_modern::model_loader::ModelLoader;
+    use bricius::model_loader::ModelLoader;
 
     // Test Utah Teapot preset
-    let teapot = ModelLoader::bryce_teapot();
-    assert_eq!(teapot.name, "Bryce Utah Teapot");
+    let teapot = ModelLoader::utah_teapot();
+    assert_eq!(teapot.name, "Utah Teapot");
     assert!(teapot.triangle_count() > 50, "Teapot should have triangles");
     assert_eq!(teapot.normals.len(), teapot.vertices.len());
 
@@ -281,8 +284,8 @@ f 1 3 4
 
 #[test]
 fn test_ray_picking_and_object_intersection() {
-    use bryce_modern::camera::Camera;
-    use bryce_modern::objects::SceneObject;
+    use bricius::camera::Camera;
+    use bricius::objects::SceneObject;
     use glam::Vec3;
 
     let camera = Camera::new(Vec3::new(0.0, 0.0, 10.0), -90.0, 0.0);
@@ -302,7 +305,7 @@ fn test_ray_picking_and_object_intersection() {
 
 #[test]
 fn test_custom_material_copy_and_serialization() {
-    use bryce_modern::material::GpuMaterial;
+    use bricius::material::GpuMaterial;
 
     let mat = GpuMaterial::blue_marble();
     let json = serde_json::to_string(&mat).expect("Material should serialize to JSON");
@@ -311,4 +314,22 @@ fn test_custom_material_copy_and_serialization() {
     assert_eq!(mat.params1, deserialized.params1);
     assert_eq!(mat.params2, deserialized.params2);
     assert_eq!(mat.base_color, deserialized.base_color);
+}
+
+#[test]
+fn test_terrain_object_heightmap_roundtrip() {
+    use bricius::terrain::TerrainObjectData;
+    let cfg = TerrainConfig::default();
+    let t = TerrainObjectData::new(64, &cfg);
+    assert!(t.heightmap.data.iter().all(|h| (0.0..=1.0).contains(h)));
+    let save = t.to_save();
+    let json = serde_json::to_string(&save).unwrap();
+    let back: bricius::terrain::TerrainObjectSave = serde_json::from_str(&json).unwrap();
+    let t2 = TerrainObjectData::from_save(&back);
+    assert_eq!(t2.heightmap.resolution, 64);
+    for (a, b) in t.heightmap.data.iter().zip(&t2.heightmap.data) {
+        assert!((a - b).abs() < 1e-4);
+    }
+    let mid = t.heightmap.sample_bilinear(0.5, 0.5);
+    assert!((0.0..=1.0).contains(&mid));
 }

@@ -447,9 +447,9 @@ impl ModelLoader {
     // BUILT-IN PROCEDURAL PRESET MODELS
     // =========================================================================
 
-    /// Classic Utah / Bryce CGI Teapot (iconic 1990s 3D creation studio motif)
-    pub fn bryce_teapot() -> LoadedMesh {
-        let mut mesh = LoadedMesh::new("Bryce Utah Teapot");
+    /// Classic Utah CGI Teapot (iconic 1990s 3D creation studio motif)
+    pub fn utah_teapot() -> LoadedMesh {
+        let mut mesh = LoadedMesh::new("Utah Teapot");
         let rings = 10;
         let sectors = 16;
         for r in 0..=rings {
@@ -493,7 +493,7 @@ impl ModelLoader {
         mesh
     }
 
-    /// Surreal 2001 / Bryce Desert Monolith (Sharp bevelled obelisk)
+    /// Surreal 2001 / Desert Monolith (Sharp bevelled obelisk)
     pub fn obelisk_monolith() -> LoadedMesh {
         let mut mesh = LoadedMesh::new("Desert Monolith Obelisk");
         let w = 0.5;

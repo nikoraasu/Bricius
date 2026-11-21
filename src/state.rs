@@ -9,6 +9,185 @@ use crate::material::GpuMaterial;
 use crate::objects::{PrimitiveType, SceneObject};
 use crate::scene::{CameraUniform, GpuPrimitive, SceneController, SceneUniform};
 
+
+/// Number of f32-aligned bytes into SceneUniform where the sample index (resolution.z) lives.
+fn sample_index_offset() -> u64 {
+    (std::mem::offset_of!(SceneUniform, resolution) + 8) as u64
+}
+
+const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+
+fn make_scene_uniform(
+    ctrl: &SceneController,
+    width: u32,
+    height: u32,
+    sample_index: f32,
+    time: f32,
+    num_prims: usize,
+    surface_srgb: bool,
+) -> SceneUniform {
+    SceneUniform {
+        sun_direction: ctrl.sun_dir(),
+        sun_color_intensity: [ctrl.sky.sun_color[0], ctrl.sky.sun_color[1], ctrl.sky.sun_color[2], ctrl.sky.sun_intensity],
+        zenith_color: ctrl.sky.zenith_color,
+        horizon_color: ctrl.sky.horizon_color,
+        ground_color: ctrl.sky.ground_color,
+        fog_params: [ctrl.sky.fog_density, ctrl.sky.fog_height_falloff, ctrl.sky.mie_coeff, ctrl.sky.cloud_coverage],
+        fog_color: ctrl.sky.fog_color,
+        water_params1: [ctrl.water.water_height, ctrl.water.wave_amplitude, ctrl.water.wave_frequency, ctrl.water.wave_speed],
+        water_params2: [ctrl.water.transparency, ctrl.water.ior, ctrl.water.roughness, ctrl.water.reflection_strength],
+        water_deep_color: ctrl.water.deep_color,
+        water_shallow_color: ctrl.water.shallow_color,
+        terrain_params1: [ctrl.terrain.height_scale, ctrl.terrain.frequency, ctrl.terrain.octaves as f32, ctrl.terrain.algorithm as u32 as f32],
+        terrain_params2: [ctrl.terrain.mountain_sharpness, ctrl.terrain.ridge_intensity, ctrl.terrain.valley_depth, ctrl.terrain.domain_warp],
+        postprocess_params: [if ctrl.postprocess.retro_90s_cgi { 1.0 } else { 0.0 }, ctrl.postprocess.bloom_intensity, ctrl.postprocess.contrast, ctrl.postprocess.saturation],
+        time_and_flags: [time, ctrl.selected_material as f32, ctrl.terrain.seed as f32, ctrl.render_mode as f32],
+        resolution: [width as f32, height as f32, sample_index, num_prims as f32],
+        post_params2: [
+            ctrl.postprocess.vignette_strength,
+            ctrl.postprocess.gamma,
+            if ctrl.postprocess.dither_16bit { 1.0 } else { 0.0 },
+            if surface_srgb { 1.0 } else { 0.0 },
+        ],
+        render_params: [
+            ctrl.postprocess.max_reflection_bounces.clamp(1, 8) as f32,
+            if ctrl.postprocess.soft_shadows { 1.0 } else { 0.0 },
+            ctrl.postprocess.sun_angular_radius_deg,
+            if ctrl.postprocess.blurry_reflections { 1.0 } else { 0.0 },
+        ],
+        ground_params: [
+            if ctrl.ground.enabled { 1.0 } else { 0.0 },
+            ctrl.ground.height,
+            ctrl.ground.material_id as f32,
+            if ctrl.water.enabled { 1.0 } else { 0.0 },
+        ],
+        light_params: [
+            ctrl.lights.iter().filter(|l| l.enabled).take(crate::light::MAX_LIGHTS).count() as f32,
+            if ctrl.terrain.backdrop_enabled { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
+        ],
+        display_params: [ctrl.postprocess.chromatic_aberration, 0.0, 0.0, 0.0],
+    }
+}
+
+fn build_camera_uniform(camera: &Camera, aspect_ratio: f32) -> CameraUniform {
+    let tan_half_fov = (camera.fov_y * 0.5).tan();
+    CameraUniform {
+        pos: [camera.position.x, camera.position.y, camera.position.z, 1.0],
+        forward: [camera.forward().x, camera.forward().y, camera.forward().z, 0.0],
+        right: [camera.right().x, camera.right().y, camera.right().z, 0.0],
+        up: [camera.up().x, camera.up().y, camera.up().z, 0.0],
+        params: [tan_half_fov, aspect_ratio, 0.1, 1000.0],
+    }
+}
+
+/// Creates the two ping-pong accumulation targets and a bind group per target
+/// (bind group i samples texture i).
+fn create_accum_targets(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    width: u32,
+    height: u32,
+) -> ([wgpu::TextureView; 2], [wgpu::BindGroup; 2]) {
+    let make = |label: &str| {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: ACCUM_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
+        });
+        (view, bg)
+    };
+    let (v0, b0) = make("Accumulation Texture A");
+    let (v1, b1) = make("Accumulation Texture B");
+    ([v0, v1], [b0, b1])
+}
+
+fn create_fullscreen_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    fs_entry: &str,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs_entry),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                // Rgba32Float is not blendable; the shaders write final values directly
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn encode_fullscreen_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    scene_bg: &wgpu::BindGroup,
+    accum_bg: &wgpu::BindGroup,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        occlusion_query_set: None,
+        timestamp_writes: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, scene_bg, &[]);
+    pass.set_bind_group(1, accum_bg, &[]);
+    pass.draw(0..3, 0..1);
+}
+
 pub struct State {
     pub window: Arc<Window>,
     pub surface: wgpu::Surface<'static>,
@@ -16,7 +195,18 @@ pub struct State {
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
-    pub render_pipeline: wgpu::RenderPipeline,
+    pub trace_pipeline: wgpu::RenderPipeline,
+    pub display_pipeline: wgpu::RenderPipeline,
+    pub display_pipeline_rgba8: wgpu::RenderPipeline,
+    pub accum_layout: wgpu::BindGroupLayout,
+    pub accum_views: [wgpu::TextureView; 2],
+    pub accum_bind_groups: [wgpu::BindGroup; 2],
+    /// Index of the accumulation texture holding the latest result
+    pub accum_cur: usize,
+    pub samples_done: u32,
+    pub accum_reset: bool,
+    pub last_state_key: Vec<u8>,
+    pub surface_is_srgb: bool,
 
     pub camera: Camera,
     pub camera_uniform: CameraUniform,
@@ -32,10 +222,15 @@ pub struct State {
 
     pub objects: Vec<SceneObject>,
     pub primitives_buffer: wgpu::Buffer,
+    pub lights_buffer: wgpu::Buffer,
 
     pub meshes: Vec<crate::model_loader::LoadedMesh>,
     pub mesh_triangles_buffer: wgpu::Buffer,
     pub mesh_dirty: bool,
+
+    pub terrains: Vec<crate::terrain::TerrainObjectData>,
+    pub terrain_buffer: wgpu::Buffer,
+    pub terrain_dirty: bool,
 
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
@@ -44,7 +239,7 @@ pub struct State {
     pub last_frame_time: Instant,
     pub frame_count: u32,
 
-    // Egui Bryce 7 Studio UI System
+    // Egui Bricius Studio UI System
     pub egui_ctx: egui::Context,
     pub egui_winit_state: egui_winit::State,
     pub egui_renderer: egui_wgpu::Renderer,
@@ -80,7 +275,7 @@ impl State {
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("Bryce Modern Device"),
+                label: Some("Bricius Device"),
                 ..Default::default()
             })
             .await
@@ -89,9 +284,14 @@ impl State {
         let width = size.width.max(1);
         let height = size.height.max(1);
 
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, width, height)
             .expect("Surface incompatible with adapter");
+        // The shader and egui both output gamma-encoded values, so prefer a non-sRGB
+        // surface format (an sRGB one would encode a second time in hardware).
+        if let Some(fmt) = surface.get_capabilities(&adapter).formats.iter().copied().find(|f| !f.is_srgb()) {
+            config.format = fmt;
+        }
         surface.configure(&device, &config);
 
         // Setup Camera
@@ -115,24 +315,7 @@ impl State {
 
         // Setup Scene Controller & Uniform
         let scene_ctrl = SceneController::new();
-        let scene_uniform = SceneUniform {
-            sun_direction: scene_ctrl.sun_dir(),
-            sun_color_intensity: [scene_ctrl.sky.sun_color[0], scene_ctrl.sky.sun_color[1], scene_ctrl.sky.sun_color[2], scene_ctrl.sky.sun_intensity],
-            zenith_color: scene_ctrl.sky.zenith_color,
-            horizon_color: scene_ctrl.sky.horizon_color,
-            ground_color: scene_ctrl.sky.ground_color,
-            fog_params: [scene_ctrl.sky.fog_density, scene_ctrl.sky.fog_height_falloff, scene_ctrl.sky.mie_coeff, scene_ctrl.sky.cloud_coverage],
-            fog_color: scene_ctrl.sky.fog_color,
-            water_params1: [scene_ctrl.water.water_height, scene_ctrl.water.wave_amplitude, scene_ctrl.water.wave_frequency, scene_ctrl.water.wave_speed],
-            water_params2: [scene_ctrl.water.transparency, scene_ctrl.water.ior, scene_ctrl.water.roughness, scene_ctrl.water.reflection_strength],
-            water_deep_color: scene_ctrl.water.deep_color,
-            water_shallow_color: scene_ctrl.water.shallow_color,
-            terrain_params1: [scene_ctrl.terrain.height_scale, scene_ctrl.terrain.frequency, scene_ctrl.terrain.octaves as f32, scene_ctrl.terrain.algorithm as u32 as f32],
-            terrain_params2: [scene_ctrl.terrain.mountain_sharpness, scene_ctrl.terrain.ridge_intensity, scene_ctrl.terrain.valley_depth, scene_ctrl.terrain.domain_warp],
-            postprocess_params: [if scene_ctrl.postprocess.retro_90s_cgi { 1.0 } else { 0.0 }, scene_ctrl.postprocess.bloom_intensity, scene_ctrl.postprocess.contrast, scene_ctrl.postprocess.saturation],
-            time_and_flags: [0.0, scene_ctrl.selected_material as f32, scene_ctrl.terrain.seed as f32, scene_ctrl.render_mode as f32],
-            resolution: [width as f32, height as f32, 0.0, 3.0],
-        };
+        let scene_uniform = make_scene_uniform(&scene_ctrl, width, height, 0.0, 0.0, 3, config.format.is_srgb());
 
         let scene_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Scene Buffer"),
@@ -171,6 +354,7 @@ impl State {
                 PrimitiveType::Cone => 4.0,
                 PrimitiveType::Pyramid => 5.0,
                 PrimitiveType::Mesh => 6.0,
+                PrimitiveType::Terrain => 7.0,
                 _ => 0.0,
             };
             gpu_prims[i] = GpuPrimitive {
@@ -189,7 +373,7 @@ impl State {
 
         // Initialize Built-in Mesh Models
         let meshes = vec![
-            crate::model_loader::ModelLoader::bryce_teapot(),
+            crate::model_loader::ModelLoader::utah_teapot(),
             crate::model_loader::ModelLoader::obelisk_monolith(),
             crate::model_loader::ModelLoader::crystal_geode(),
             crate::model_loader::ModelLoader::starfighter_ship(),
@@ -228,7 +412,23 @@ impl State {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Create Bind Group Layout (5 bindings)
+        // Terrain heightmaps storage buffer (concatenated f32 grids)
+        let terrains: Vec<crate::terrain::TerrainObjectData> = Vec::new();
+        let terrain_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Terrain Heightmaps Buffer"),
+            contents: bytemuck::cast_slice(&Self::pack_terrain_heights(&terrains)),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Lights uniform buffer (8 x GpuLight)
+        let (gpu_lights, _) = crate::light::GpuLight::pack(&scene_ctrl.lights);
+        let lights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Lights Buffer"),
+            contents: bytemuck::cast_slice(&gpu_lights),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create Bind Group Layout (7 bindings)
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Main Bind Group Layout"),
             entries: &[
@@ -282,6 +482,26 @@ impl State {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -309,56 +529,50 @@ impl State {
                     binding: 4,
                     resource: mesh_triangles_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: terrain_buffer.as_entire_binding(),
+                },
             ],
         });
 
         // Load WGSL Shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Bryce Render Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/bryce_render.wgsl").into()),
+            label: Some("Bricius Render Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/bricius_render.wgsl").into()),
         });
+
+        let accum_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Accumulation Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let (accum_views, accum_bind_groups) = create_accum_targets(&device, &accum_layout, width, height);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&accum_layout)],
             immediate_size: 0,
         });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Bryce Render Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let trace_pipeline = create_fullscreen_pipeline(&device, &shader, &pipeline_layout, "fs_trace", ACCUM_FORMAT, "Bricius Trace Pipeline");
+        let display_pipeline = create_fullscreen_pipeline(&device, &shader, &pipeline_layout, "fs_display", config.format, "Bricius Display Pipeline");
+        let display_pipeline_rgba8 = create_fullscreen_pipeline(&device, &shader, &pipeline_layout, "fs_display", wgpu::TextureFormat::Rgba8Unorm, "Bricius Still Display Pipeline");
+        let surface_is_srgb = config.format.is_srgb();
 
-        // Initialize Egui & Bryce 7 Studio UI
+        // Initialize Egui & Bricius Studio UI
         let egui_ctx = egui::Context::default();
         let egui_winit_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -387,7 +601,17 @@ impl State {
             queue,
             config,
             size,
-            render_pipeline,
+            trace_pipeline,
+            display_pipeline,
+            display_pipeline_rgba8,
+            accum_layout,
+            accum_views,
+            accum_bind_groups,
+            accum_cur: 0,
+            samples_done: 0,
+            accum_reset: true,
+            last_state_key: Vec::new(),
+            surface_is_srgb,
             camera,
             camera_uniform,
             camera_buffer,
@@ -399,9 +623,13 @@ impl State {
             material_dirty: false,
             objects,
             primitives_buffer,
+            lights_buffer,
             meshes,
             mesh_triangles_buffer,
             mesh_dirty: false,
+            terrains,
+            terrain_buffer,
+            terrain_dirty: false,
             bind_group_layout,
             bind_group,
             start_time: Instant::now(),
@@ -418,6 +646,28 @@ impl State {
             drag_start_mouse: glam::Vec2::ZERO,
             last_mouse_pos: None,
         }
+    }
+
+    /// Concatenate all terrain heightmaps into one f32 array (never empty: storage buffers need >0 bytes)
+    pub fn pack_terrain_heights(terrains: &[crate::terrain::TerrainObjectData]) -> Vec<f32> {
+        let mut out: Vec<f32> = Vec::new();
+        for t in terrains {
+            out.extend_from_slice(&t.heightmap.data);
+        }
+        if out.is_empty() {
+            out.push(0.0);
+        }
+        out
+    }
+
+    pub fn rebuild_terrain_buffer(&mut self) {
+        self.terrain_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Terrain Heightmaps Buffer"),
+            contents: bytemuck::cast_slice(&Self::pack_terrain_heights(&self.terrains)),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        self.rebuild_bind_group();
+        self.terrain_dirty = false;
     }
 
     pub fn rebuild_mesh_buffer(&mut self) {
@@ -454,6 +704,11 @@ impl State {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
+        self.rebuild_bind_group();
+        self.mesh_dirty = false;
+    }
+
+    pub fn rebuild_bind_group(&mut self) {
         self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Main Bind Group"),
             layout: &self.bind_group_layout,
@@ -478,9 +733,16 @@ impl State {
                     binding: 4,
                     resource: self.mesh_triangles_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: self.terrain_buffer.as_entire_binding(),
+                },
             ],
         });
-        self.mesh_dirty = false;
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -489,6 +751,11 @@ impl State {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            let (views, bgs) = create_accum_targets(&self.device, &self.accum_layout, new_size.width, new_size.height);
+            self.accum_views = views;
+            self.accum_bind_groups = bgs;
+            self.accum_cur = 0;
+            self.accum_reset = true;
         }
     }
 
@@ -541,15 +808,8 @@ impl State {
         }
 
         // Update Camera Uniform
-        let tan_half_fov = (self.camera.fov_y * 0.5).tan();
         let aspect_ratio = self.config.width as f32 / self.config.height as f32;
-        self.camera_uniform = CameraUniform {
-            pos: [self.camera.position.x, self.camera.position.y, self.camera.position.z, 1.0],
-            forward: [self.camera.forward().x, self.camera.forward().y, self.camera.forward().z, 0.0],
-            right: [self.camera.right().x, self.camera.right().y, self.camera.right().z, 0.0],
-            up: [self.camera.up().x, self.camera.up().y, self.camera.up().z, 0.0],
-            params: [tan_half_fov, aspect_ratio, 0.1, 1000.0],
-        };
+        self.camera_uniform = build_camera_uniform(&self.camera, aspect_ratio);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
 
         // Update Dynamic Scene Primitives Buffer
@@ -571,6 +831,7 @@ impl State {
                 PrimitiveType::Cone => 4.0,
                 PrimitiveType::Pyramid => 5.0,
                 PrimitiveType::Mesh => 6.0,
+                PrimitiveType::Terrain => 7.0,
                 _ => 0.0,
             };
 
@@ -588,36 +849,55 @@ impl State {
                 (0.0, 0.0)
             };
 
+            // Terrains reuse tri_offset/tri_count: heightmap float offset and grid resolution
+            let (tri_offset, tri_count) = match obj.terrain_id {
+                Some(tid) if tid < self.terrains.len() => {
+                    let off: usize = self.terrains[..tid].iter().map(|t| t.heightmap.data.len()).sum();
+                    (off as f32, self.terrains[tid].heightmap.resolution as f32)
+                }
+                _ => (tri_offset, tri_count),
+            };
+            // A terrain object with a missing heightmap is hidden
+            let visible = obj.visible && (obj.primitive != PrimitiveType::Terrain
+                || obj.terrain_id.map_or(false, |t| t < self.terrains.len()));
+
             gpu_prims[i] = GpuPrimitive {
                 pos_and_type: [obj.position[0], obj.position[1], obj.position[2], prim_type],
                 scale_and_mat: [obj.scale[0], obj.scale[1], obj.scale[2], obj.material_id as f32],
                 rot_and_csg: [obj.rotation[0], obj.rotation[1], obj.rotation[2], obj.csg_op as u32 as f32],
-                extra: [if obj.visible { 1.0 } else { 0.0 }, tri_offset, tri_count, 0.0],
+                extra: [if visible { 1.0 } else { 0.0 }, tri_offset, tri_count, 0.0],
             };
         }
         self.queue.write_buffer(&self.primitives_buffer, 0, bytemuck::cast_slice(&gpu_prims));
 
-        // Update Scene Uniform
-        let ctrl = &self.scene_ctrl;
-        self.scene_uniform = SceneUniform {
-            sun_direction: ctrl.sun_dir(),
-            sun_color_intensity: [ctrl.sky.sun_color[0], ctrl.sky.sun_color[1], ctrl.sky.sun_color[2], ctrl.sky.sun_intensity],
-            zenith_color: ctrl.sky.zenith_color,
-            horizon_color: ctrl.sky.horizon_color,
-            ground_color: ctrl.sky.ground_color,
-            fog_params: [ctrl.sky.fog_density, ctrl.sky.fog_height_falloff, ctrl.sky.mie_coeff, ctrl.sky.cloud_coverage],
-            fog_color: ctrl.sky.fog_color,
-            water_params1: [ctrl.water.water_height, ctrl.water.wave_amplitude, ctrl.water.wave_frequency, ctrl.water.wave_speed],
-            water_params2: [ctrl.water.transparency, ctrl.water.ior, ctrl.water.roughness, ctrl.water.reflection_strength],
-            water_deep_color: ctrl.water.deep_color,
-            water_shallow_color: ctrl.water.shallow_color,
-            terrain_params1: [ctrl.terrain.height_scale, ctrl.terrain.frequency, ctrl.terrain.octaves as f32, ctrl.terrain.algorithm as u32 as f32],
-            terrain_params2: [ctrl.terrain.mountain_sharpness, ctrl.terrain.ridge_intensity, ctrl.terrain.valley_depth, ctrl.terrain.domain_warp],
-            postprocess_params: [if ctrl.postprocess.retro_90s_cgi { 1.0 } else { 0.0 }, ctrl.postprocess.bloom_intensity, ctrl.postprocess.contrast, ctrl.postprocess.saturation],
-            time_and_flags: [elapsed, ctrl.selected_material as f32, ctrl.terrain.seed as f32, ctrl.render_mode as f32],
-            resolution: [self.config.width as f32, self.config.height as f32, self.frame_count as f32, count as f32],
-        };
+        let (gpu_lights, _) = crate::light::GpuLight::pack(&self.scene_ctrl.lights);
+        self.queue.write_buffer(&self.lights_buffer, 0, bytemuck::cast_slice(&gpu_lights));
+
+        // Update Scene Uniform (shader time is frozen unless waves are animated, so accumulation converges)
+        let shader_time = if self.scene_ctrl.water.animate { elapsed } else { 0.0 };
+        self.scene_uniform = make_scene_uniform(&self.scene_ctrl, self.config.width, self.config.height, 0.0, shader_time, count, self.surface_is_srgb);
         self.queue.write_buffer(&self.scene_buffer, 0, bytemuck::cast_slice(&[self.scene_uniform]));
+
+        // Detect anything that changes the traced image and restart accumulation.
+        // Excluded: shader time, sample counter and display-only post-processing params.
+        let mut scene_key = self.scene_uniform;
+        scene_key.time_and_flags[0] = 0.0;
+        scene_key.resolution[2] = 0.0;
+        scene_key.postprocess_params = [0.0; 4];
+        scene_key.post_params2 = [0.0; 4];
+        scene_key.display_params = [0.0; 4];
+        let mut key = Vec::with_capacity(4096);
+        key.extend_from_slice(bytemuck::bytes_of(&self.camera_uniform));
+        key.extend_from_slice(bytemuck::bytes_of(&scene_key));
+        key.extend_from_slice(bytemuck::cast_slice(&gpu_prims));
+        key.extend_from_slice(bytemuck::cast_slice(&gpu_lights));
+        if key != self.last_state_key {
+            self.last_state_key = key;
+            self.accum_reset = true;
+        }
+        if self.scene_ctrl.water.animate {
+            self.accum_reset = true;
+        }
     }
 
     pub fn render(&mut self) -> Result<(), &'static str> {
@@ -640,11 +920,12 @@ impl State {
 
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // 1. Run Egui Bryce 7 Studio UI Pass
+        // 1. Run Egui Bricius Studio UI Pass
         let raw_input = self.egui_winit_state.take_egui_input(&self.window);
         self.egui_ctx.begin_pass(raw_input);
         let mut mat_dirty = self.material_dirty;
         let mut mesh_dirty = self.mesh_dirty;
+        let mut terrain_dirty = self.terrain_dirty;
         self.editor.draw(
             &self.egui_ctx,
             &mut self.scene_ctrl,
@@ -654,12 +935,20 @@ impl State {
             &mut self.meshes,
             &mut mat_dirty,
             &mut mesh_dirty,
+            &mut self.terrains,
+            &mut terrain_dirty,
         );
         self.material_dirty = mat_dirty;
         self.mesh_dirty = mesh_dirty;
+        self.terrain_dirty = terrain_dirty;
+        if self.terrain_dirty {
+            self.rebuild_terrain_buffer();
+            self.accum_reset = true;
+        }
 
         if self.mesh_dirty {
             self.rebuild_mesh_buffer();
+            self.accum_reset = true;
         }
         let full_output = self.egui_ctx.end_pass();
 
@@ -671,6 +960,7 @@ impl State {
                 bytemuck::cast_slice(&self.materials),
             );
             self.material_dirty = false;
+            self.accum_reset = true;
         }
 
         self.egui_winit_state.handle_platform_output(&self.window, full_output.platform_output);
@@ -698,10 +988,41 @@ impl State {
             &screen_descriptor,
         );
 
-        // 2. Render Pass: Draw Procedural 3D Environment + Egui Bryce Studio Overlay
+        // 2a. Progressive accumulation: trace one more jittered sample until the target is reached
+        if self.accum_reset {
+            self.samples_done = 0;
+            self.accum_reset = false;
+        }
+        let target_samples = if self.scene_ctrl.water.animate {
+            1
+        } else {
+            self.scene_ctrl.postprocess.quality.target_samples()
+        };
+        if self.samples_done < target_samples {
+            self.queue.write_buffer(
+                &self.scene_buffer,
+                sample_index_offset(),
+                bytemuck::bytes_of(&(self.samples_done as f32)),
+            );
+            let dst = 1 - self.accum_cur;
+            encode_fullscreen_pass(
+                &mut encoder,
+                "Bricius Trace Pass",
+                &self.accum_views[dst],
+                &self.trace_pipeline,
+                &self.bind_group,
+                &self.accum_bind_groups[self.accum_cur],
+            );
+            self.accum_cur = dst;
+            self.samples_done += 1;
+        }
+        self.editor.samples_done = self.samples_done;
+        self.editor.sample_target = target_samples;
+
+        // 2b. Render Pass: Display accumulated image (post-processing) + Egui Bricius Studio Overlay
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Bryce Viewport Pass"),
+                label: Some("Bricius Viewport Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     depth_slice: None,
@@ -722,12 +1043,13 @@ impl State {
                 multiview_mask: None,
             }).forget_lifetime();
 
-            // Draw 3D Procedural Raytracer
-            render_pass.set_pipeline(&self.render_pipeline);
+            // Draw accumulated 3D image
+            render_pass.set_pipeline(&self.display_pipeline);
             render_pass.set_bind_group(0, &self.bind_group, &[]);
+            render_pass.set_bind_group(1, &self.accum_bind_groups[self.accum_cur], &[]);
             render_pass.draw(0..3, 0..1);
 
-            // Draw Bryce Studio UI
+            // Draw Bricius Studio UI
             self.egui_renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
         }
 
@@ -743,8 +1065,65 @@ impl State {
     }
 
     pub fn capture_still_frame(&mut self) {
-        let width = self.config.width.max(1);
-        let height = self.config.height.max(1);
+        let pp = self.scene_ctrl.postprocess.clone();
+        let width = pp.render_width.clamp(16, 8192);
+        let height = pp.render_height.clamp(16, 8192);
+        let samples = pp.still_samples.clamp(1, 4096);
+
+        // Dedicated uniforms so the still render has its own resolution / aspect / sample counter
+        let elapsed = Instant::now().duration_since(self.start_time).as_secs_f32();
+        let shader_time = if self.scene_ctrl.water.animate { elapsed } else { 0.0 };
+        let num_prims = self.objects.len().min(32);
+        let still_camera = build_camera_uniform(&self.camera, width as f32 / height as f32);
+        let still_scene = make_scene_uniform(&self.scene_ctrl, width, height, 0.0, shader_time, num_prims, false);
+
+        let still_camera_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Still Camera Buffer"),
+            contents: bytemuck::cast_slice(&[still_camera]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let still_scene_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Still Scene Buffer"),
+            contents: bytemuck::cast_slice(&[still_scene]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let still_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Still Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: still_camera_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: still_scene_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: self.materials_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: self.primitives_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.mesh_triangles_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: self.lights_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.terrain_buffer.as_entire_binding() },
+            ],
+        });
+        let (still_views, still_bgs) = create_accum_targets(&self.device, &self.accum_layout, width, height);
+
+        // Accumulate jittered samples (one submission per sample keeps GPU work units short
+        // and lets each sample see its own sample-index uniform value)
+        let mut cur = 0usize;
+        for i in 0..samples {
+            self.queue.write_buffer(&still_scene_buffer, sample_index_offset(), bytemuck::bytes_of(&(i as f32)));
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Still Trace Encoder"),
+            });
+            encode_fullscreen_pass(
+                &mut enc,
+                "Still Trace Pass",
+                &still_views[1 - cur],
+                &self.trace_pipeline,
+                &still_bind_group,
+                &still_bgs[cur],
+            );
+            self.queue.submit(Some(enc.finish()));
+            cur = 1 - cur;
+            if i % 4 == 3 {
+                let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            }
+        }
 
         let capture_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Still Render Capture Texture"),
@@ -756,45 +1135,25 @@ impl State {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-
         let view = capture_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Still Render Encoder"),
         });
 
-        // 1. Render pure 3D procedural environment (no UI)
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Still Scene Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.10,
-                            b: 0.15,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.draw(0..3, 0..1);
-        }
+        // Post-process the accumulated linear image into the 8-bit target (no UI)
+        encode_fullscreen_pass(
+            &mut encoder,
+            "Still Display Pass",
+            &view,
+            &self.display_pipeline_rgba8,
+            &still_bind_group,
+            &still_bgs[cur],
+        );
 
         // 2. Setup Staging Buffer to copy pixels back to CPU
         let bytes_per_pixel = 4;
@@ -848,10 +1207,8 @@ impl State {
             let data = buffer_slice.get_mapped_range();
             let mut rgba_pixels = Vec::with_capacity((width * height * 4) as usize);
 
-            let is_bgra = matches!(
-                self.config.format,
-                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-            );
+            // Still capture target is always Rgba8Unorm (no channel swap needed)
+            let is_bgra = false;
 
             for y in 0..height {
                 let row_start = (y * padded_bytes_per_row) as usize;
@@ -880,10 +1237,10 @@ impl State {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let path = format!("bryce_render_{}.png", timestamp);
+                let path = format!("bricius_render_{}.png", timestamp);
                 match img.save(&path) {
                     Ok(_) => {
-                        let _ = img.save("bryce_artwork.png");
+                        let _ = img.save("bricius_artwork.png");
                         self.editor.status_message = format!("📸 Rendered & saved {} ({}x{})", path, width, height);
                         println!("📸 Rendered still frame saved to: {}", path);
                     }

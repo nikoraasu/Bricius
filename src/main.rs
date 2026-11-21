@@ -1,7 +1,9 @@
 mod camera;
 mod editor;
 mod generator;
+mod ground;
 mod io;
+mod light;
 mod material;
 mod model_loader;
 mod objects;
@@ -30,7 +32,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_none() {
             let window_attributes = Window::default_attributes()
-                .with_title("Bryce 7 Pro - 3D Environment Creation Studio (Rust + wgpu)")
+                .with_title("Bricius - 3D Environment Creation Studio (Rust + wgpu)")
                 .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 840.0));
 
             let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
@@ -312,7 +314,7 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::init();
     println!("============================================================");
-    println!(" Bryce 7 Pro - Complete 3D Environment Creation Studio");
+    println!(" Bricius - Complete 3D Environment Creation Studio");
     println!(" Controls:");
     println!("  - Tab              : Toggle Studio Editor UI on/off");
     println!("  - F1               : Open In-Studio Interactive Tutorial & Guide");
