@@ -87,6 +87,11 @@ impl ApplicationHandler for App {
                     state.editor.visible = !state.editor.visible;
                     return;
                 }
+                if key_code == KeyCode::F1 && element_state == ElementState::Pressed {
+                    state.editor.active_lab = crate::editor::ActiveLab::Tutorial;
+                    state.editor.visible = true;
+                    return;
+                }
                 match element_state {
                     winit::event::ElementState::Pressed => {
                         state.keys_pressed.insert(key_code);
@@ -135,12 +140,14 @@ fn main() {
     println!(" Bryce 7 Pro - Complete 3D Environment Creation Studio");
     println!(" Controls:");
     println!("  - Tab              : Toggle Studio Editor UI on/off");
+    println!("  - F1               : Open In-Studio Interactive Tutorial & Guide");
     println!("  - Mouse Drag (LMB) : Rotate 3D Camera / Look Around");
     println!("  - W, A, S, D       : Fly camera forward / left / back / right");
     println!("  - Space / E        : Fly camera Up");
     println!("  - Shift / Q        : Fly camera Down");
     println!("  - Arrow Left/Right : Rotate Sun Azimuth (360° celestial orbit)");
     println!("  - Arrow Up/Down    : Adjust Sun Elevation (dawn to dusk)");
+    println!("  - 1 through 8      : Quick-swap procedural materials on showcase orb");
     println!("  - ESC              : Exit Studio");
     println!("============================================================");
 

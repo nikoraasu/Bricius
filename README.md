@@ -92,16 +92,33 @@ Built with **Rust**, **`wgpu`**, and **`egui`**, featuring real-time procedural 
 
 ---
 
+### 8. 🎓 In-Studio Interactive Tutorial & Controls Guide
+- **Interactive 9-Step Studio Walkthrough**:
+  - Step 1: 🚀 6-DOF Fly Camera & Viewport Navigation (with framing presets: Default Vista, Ground Low-Angle, Aerial Bird's Eye)
+  - Step 2: 🎲 One-Click Procedural Worlds & Component Rerolling
+  - Step 3: ⛰️ Ken Musgrave Fractal Terrains & 2D Heightmap Canvas Sculptor
+  - Step 4: 🌅 Sky Lab & Celestial Atmospheric Volumetrics
+  - Step 5: 🌊 Infinite Water Plane & Ocean Physics
+  - Step 6: 🎨 Deep Texture Editor (DTE) & 3D Spatial Texturing
+  - Step 7: 🔮 3D Scene Composition & CSG Booleans
+  - Step 8: 🌲 Vegetation & Rock Scatter System
+  - Step 9: 🎥 Render Lab, Retro 1990s CGI & Project Export
+- **Hands-On Action Buttons**: Every tutorial step includes one-click action buttons to test the features and jump directly to the relevant lab.
+- **Floating Controls HUD**: Sleek semi-transparent floating card displaying all keyboard & mouse shortcuts at a glance.
+
+---
+
 ## Studio Controls
 
 | Input | Action |
 | :--- | :--- |
 | **`Tab`** | Toggle Bryce 7 Studio GUI on / off |
+| **`F1`** | Open In-Studio Interactive Tutorial & Controls Guide |
 | **Mouse Left Drag** | Look around / rotate camera (6-DOF) |
 | **`W`, `A`, `S`, `D`** | Fly camera forward, left, backward, right |
 | **`Space` / `E`** | Ascend vertically |
 | **`Shift` / `Q`** | Descend vertically |
-| **`Left` / `Right Arrow`** | Rotate Sun Azimuth (360° orbit) |
+| **`Left` / `Right Arrow`** | Rotate Sun Azimuth (360° celestial orbit) |
 | **`Up` / `Down Arrow`** | Adjust Sun Elevation (dawn to noon to dusk) |
 | **`1` through `8`** | Quick-swap procedural material on central orb |
 | **`Esc`** | Exit application |

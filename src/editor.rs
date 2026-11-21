@@ -1,4 +1,5 @@
 use egui::{Color32, RichText, Slider, Ui, Vec2};
+use glam::Vec3;
 
 use crate::camera::Camera;
 use crate::generator::{SceneGenerator, SceneTheme};
@@ -30,12 +31,13 @@ fn height_to_bryce_color(h: f32) -> Color32 {
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum ActiveLab {
+    Tutorial,
+    Generator,
     Terrain,
     Sky,
     Water,
     Materials,
     Scene,
-    Generator,
     Render,
 }
 
@@ -53,6 +55,8 @@ pub struct EditorState {
     pub heightmap_dirty: bool,
     pub heightmap_texture: Option<egui::TextureHandle>,
     pub scatter_config: ScatterSystem,
+    pub tutorial_step: usize,
+    pub show_controls_hud: bool,
     pub status_message: String,
     pub fps: f32,
     pub frame_time_ms: f32,
@@ -65,7 +69,7 @@ impl EditorState {
 
         Self {
             visible: true,
-            active_lab: ActiveLab::Generator,
+            active_lab: ActiveLab::Tutorial,
             selected_material_slot: 1,
             selected_object_idx: 0,
             brush_mode: BrushMode::Raise,
@@ -76,7 +80,9 @@ impl EditorState {
             heightmap_dirty: true,
             heightmap_texture: None,
             scatter_config: ScatterSystem::default(),
-            status_message: "Bryce 7 Environment Studio Ready. Select a lab to begin.".to_string(),
+            tutorial_step: 0,
+            show_controls_hud: true,
+            status_message: "Welcome to Bryce 7 Pro Studio! Follow the tutorial or press F1 anytime.".to_string(),
             fps: 60.0,
             frame_time_ms: 16.6,
         }
@@ -151,6 +157,7 @@ impl EditorState {
                             ui.separator();
 
                             let labs = [
+                                (ActiveLab::Tutorial, "🎓 Tutorial & Controls (F1)"),
                                 (ActiveLab::Generator, "🎲 1-Click Generator"),
                                 (ActiveLab::Terrain, "⛰️ Terrain Lab & Sculptor"),
                                 (ActiveLab::Sky, "🌅 Sky & Atmosphere"),
@@ -177,6 +184,9 @@ impl EditorState {
                                 if ui.button("Hide UI [Tab]").clicked() {
                                     self.visible = false;
                                 }
+                                if ui.button(if self.show_controls_hud { "⌨️ Hide HUD" } else { "⌨️ Controls HUD" }).clicked() {
+                                    self.show_controls_hud = !self.show_controls_hud;
+                                }
                                 ui.label(format!("{:.1} FPS ({:.1} ms)", self.fps, self.frame_time_ms));
                             });
                         });
@@ -184,9 +194,76 @@ impl EditorState {
             });
 
         // =========================================================================
+        // FLOATING CONTROLS QUICK REFERENCE HUD OVERLAY
+        // =========================================================================
+        if self.show_controls_hud {
+            egui::Area::new(egui::Id::new("bryce_controls_hud_card"))
+                .fixed_pos(egui::pos2(screen.width() - 315.0, 65.0))
+                .show(ctx, |ui: &mut Ui| {
+                    egui::Frame::new()
+                        .fill(Color32::from_rgba_unmultiplied(16, 18, 24, 235))
+                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 60, 80)))
+                        .corner_radius(6.0)
+                        .inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 10 })
+                        .show(ui, |ui: &mut Ui| {
+                            ui.set_width(290.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("⌨️ Controls Quick Reference").strong().size(12.0).color(Color32::from_rgb(0, 220, 240)));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("✕").clicked() {
+                                        self.show_controls_hud = false;
+                                    }
+                                });
+                            });
+                            ui.separator();
+                            egui::Grid::new("hud_grid").spacing(egui::vec2(10.0, 4.0)).show(ui, |ui| {
+                                ui.label(RichText::new("W, A, S, D").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                                ui.label(RichText::new("Fly Camera Forward/Left/Back/Right").size(11.0));
+                                ui.end_row();
+
+                                ui.label(RichText::new("Space / Shift").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                                ui.label(RichText::new("Fly Altitude (Ascend / Descend)").size(11.0));
+                                ui.end_row();
+
+                                ui.label(RichText::new("LMB Drag").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                                ui.label(RichText::new("360° Mouse Look / View Orbit").size(11.0));
+                                ui.end_row();
+
+                                ui.label(RichText::new("Left / Right").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                                ui.label(RichText::new("Sun Azimuth Orbit (360°)").size(11.0));
+                                ui.end_row();
+
+                                ui.label(RichText::new("Up / Down").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                                ui.label(RichText::new("Sun Elevation (Dawn/Noon/Dusk)").size(11.0));
+                                ui.end_row();
+
+                                ui.label(RichText::new("Keys 1 – 8").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                                ui.label(RichText::new("Quick Material Swap on Orb").size(11.0));
+                                ui.end_row();
+
+                                ui.label(RichText::new("Tab").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                                ui.label(RichText::new("Toggle Studio UI On / Off").size(11.0));
+                                ui.end_row();
+
+                                ui.label(RichText::new("F1").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                                ui.label(RichText::new("Open Studio Tutorial & Guide").size(11.0));
+                                ui.end_row();
+                            });
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                if ui.button("🎓 Open Step-by-Step Tutorial").clicked() {
+                                    self.active_lab = ActiveLab::Tutorial;
+                                }
+                            });
+                        });
+                });
+        }
+
+        // =========================================================================
         // ACTIVE LAB WORKSPACE WINDOW
         // =========================================================================
         egui::Window::new(match self.active_lab {
+            ActiveLab::Tutorial => "🎓 In-Studio Interactive Tutorial & Controls Guide",
             ActiveLab::Generator => "🎲 Procedural 1-Click World Generator",
             ActiveLab::Terrain => "⛰️ Terrain Lab & Interactive Heightmap Sculptor",
             ActiveLab::Sky => "🌅 Sky Lab & Atmospheric Volumetrics",
@@ -196,12 +273,15 @@ impl EditorState {
             ActiveLab::Render => "🎥 Render Settings & Project Export",
         })
         .default_pos(egui::pos2(20.0, 65.0))
-        .default_size(Vec2::new(460.0, 620.0))
+        .default_size(Vec2::new(500.0, 640.0))
         .resizable(true)
         .collapsible(true)
         .show(ctx, |ui: &mut Ui| {
             egui::ScrollArea::vertical().show(ui, |ui: &mut Ui| {
                 match self.active_lab {
+                    ActiveLab::Tutorial => {
+                        self.draw_tutorial_lab(ui, scene_ctrl, camera, materials, objects, material_dirty);
+                    }
                     ActiveLab::Generator => {
                         self.draw_generator_lab(ui, scene_ctrl, materials, objects);
                     }
@@ -244,6 +324,494 @@ impl EditorState {
                         });
                     });
             });
+    }
+
+    // -------------------------------------------------------------------------
+    // IN-STUDIO INTERACTIVE TUTORIAL & CONTROLS GUIDE
+    // -------------------------------------------------------------------------
+    fn draw_tutorial_lab(
+        &mut self,
+        ui: &mut Ui,
+        scene_ctrl: &mut SceneController,
+        camera: &mut Camera,
+        materials: &mut [GpuMaterial; GpuMaterial::NUM_PRESETS],
+        objects: &mut Vec<SceneObject>,
+        material_dirty: &mut bool,
+    ) {
+        ui.heading("🎓 Bryce 7 Pro Interactive Studio Tutorial");
+        ui.label(RichText::new("A complete hands-on guide to 3D environment creation, procedural algorithms, and studio controls.").size(12.0).color(Color32::from_rgb(180, 195, 215)));
+
+        ui.separator();
+
+        const TOTAL_STEPS: usize = 9;
+        let step_titles = [
+            "1. 🚀 Viewport & Fly Camera Navigation",
+            "2. 🎲 1-Click Procedural Worlds & Rerolling",
+            "3. ⛰️ Ken Musgrave Fractal Terrains & 2D Sculptor",
+            "4. 🌅 Sky Lab & Celestial Atmospheric Volumetrics",
+            "5. 🌊 Infinite Water Plane & Ocean Physics",
+            "6. 🎨 Deep Texture Editor (DTE) & 3D Materials",
+            "7. 🔮 3D Scene Composition & CSG Booleans",
+            "8. 🌲 Vegetation & Rock Scatter System",
+            "9. 🎥 Render Lab, Retro 1990s CGI & Project Export",
+        ];
+
+        // Step navigation selector
+        ui.horizontal(|ui| {
+            if ui.button("⬅ Previous").clicked() {
+                self.tutorial_step = self.tutorial_step.saturating_sub(1);
+            }
+
+            for s in 0..TOTAL_STEPS {
+                let is_cur = self.tutorial_step == s;
+                let btn = if is_cur {
+                    RichText::new(format!("{}", s + 1)).strong().color(Color32::from_rgb(0, 240, 255))
+                } else {
+                    RichText::new(format!("{}", s + 1)).color(Color32::from_rgb(160, 170, 185))
+                };
+                if ui.selectable_label(is_cur, btn).clicked() {
+                    self.tutorial_step = s;
+                }
+            }
+
+            if ui.button("Next ➡").clicked() {
+                if self.tutorial_step + 1 < TOTAL_STEPS {
+                    self.tutorial_step += 1;
+                }
+            }
+        });
+
+        ui.add(
+            egui::ProgressBar::new((self.tutorial_step + 1) as f32 / TOTAL_STEPS as f32)
+                .text(RichText::new(step_titles[self.tutorial_step]).strong().size(12.0))
+        );
+
+        ui.separator();
+
+        match self.tutorial_step {
+            0 => {
+                // Step 1: Navigation
+                ui.heading("Step 1: 6-DOF Fly Camera & Navigation Controls");
+                ui.label("Bryce uses a continuous 3D coordinate system where you can freely navigate and frame your scene from any angle.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("⌨️ Core Navigation Keys:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    egui::Grid::new("nav_keys_grid").spacing(egui::vec2(12.0, 6.0)).show(ui, |ui| {
+                        ui.label(RichText::new("W, A, S, D").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                        ui.label("Fly Camera forward, left, backward, and right in 3D space.");
+                        ui.end_row();
+
+                        ui.label(RichText::new("Space / Shift").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                        ui.label("Fly Camera altitude vertically: Space ascends, Shift descends.");
+                        ui.end_row();
+
+                        ui.label(RichText::new("LMB Drag").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                        ui.label("Click and drag Left Mouse Button in the viewport for 360° mouse look.");
+                        ui.end_row();
+
+                        ui.label(RichText::new("Tab").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                        ui.label("Toggle Studio UI on/off to enjoy an unobstructed cinematic view.");
+                        ui.end_row();
+
+                        ui.label(RichText::new("F1").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
+                        ui.label("Return to this interactive tutorial at any time.");
+                        ui.end_row();
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("⚡ Interactive Camera Framing Presets:").strong());
+                ui.label("Click any preset below to instantly move the camera to a classic framing angle:");
+
+                ui.horizontal(|ui| {
+                    if ui.button("🎥 Default Vista").clicked() {
+                        camera.position = Vec3::new(0.0, 7.5, 24.0);
+                        camera.yaw = -90.0_f32.to_radians();
+                        camera.pitch = -8.0_f32.to_radians();
+                        self.status_message = "Camera set to Default Landscape Vista.".to_string();
+                    }
+                    if ui.button("🏔️ Ground Low-Angle").clicked() {
+                        camera.position = Vec3::new(0.0, 1.2, 14.0);
+                        camera.yaw = -90.0_f32.to_radians();
+                        camera.pitch = 18.0_f32.to_radians();
+                        self.status_message = "Camera set to Dramatic Ground Low-Angle.".to_string();
+                    }
+                    if ui.button("🦅 Aerial Bird's Eye").clicked() {
+                        camera.position = Vec3::new(0.0, 34.0, 22.0);
+                        camera.yaw = -90.0_f32.to_radians();
+                        camera.pitch = -50.0_f32.to_radians();
+                        self.status_message = "Camera set to Aerial Bird's Eye View.".to_string();
+                    }
+                });
+
+                ui.add_space(10.0);
+                if ui.button("Next: 1-Click World Generation ➡").clicked() {
+                    self.tutorial_step = 1;
+                }
+            }
+            1 => {
+                // Step 2: World Generation
+                ui.heading("Step 2: One-Click Procedural Worlds & Themes");
+                ui.label("One of Bryce's signature hallmarks is the ability to instantly generate an entire surreal or photorealistic world with a single click.");
+                ui.label("A generated world configures fractal terrain elevation, atmospheric Rayleigh/Mie scattering, Gerstner ocean waves, and 3D compositions.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("⚡ Try One-Click Themes:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    ui.horizontal(|ui| {
+                        if ui.button("🏜️ Classic Bryce 1994").clicked() {
+                            let seed = rand_pseudo_u32();
+                            SceneGenerator::generate_world(
+                                SceneTheme::ClassicBryce1994,
+                                seed,
+                                &mut scene_ctrl.terrain,
+                                &mut scene_ctrl.sky,
+                                &mut scene_ctrl.water,
+                                objects,
+                                &mut scene_ctrl.postprocess,
+                            );
+                            self.heightmap.generate_from_config(&scene_ctrl.terrain);
+                            self.heightmap_dirty = true;
+                            self.status_message = "Generated Classic Bryce 1994 Canyon.".to_string();
+                        }
+                        if ui.button("🏔️ Alpine Fjord").clicked() {
+                            let seed = rand_pseudo_u32();
+                            SceneGenerator::generate_world(
+                                SceneTheme::AlpineFjord,
+                                seed,
+                                &mut scene_ctrl.terrain,
+                                &mut scene_ctrl.sky,
+                                &mut scene_ctrl.water,
+                                objects,
+                                &mut scene_ctrl.postprocess,
+                            );
+                            self.heightmap.generate_from_config(&scene_ctrl.terrain);
+                            self.heightmap_dirty = true;
+                            self.status_message = "Generated Alpine Fjord & Glacial Lake.".to_string();
+                        }
+                        if ui.button("🪐 Alien Pandora").clicked() {
+                            let seed = rand_pseudo_u32();
+                            SceneGenerator::generate_world(
+                                SceneTheme::AlienPandora,
+                                seed,
+                                &mut scene_ctrl.terrain,
+                                &mut scene_ctrl.sky,
+                                &mut scene_ctrl.water,
+                                objects,
+                                &mut scene_ctrl.postprocess,
+                            );
+                            self.heightmap.generate_from_config(&scene_ctrl.terrain);
+                            self.heightmap_dirty = true;
+                            self.status_message = "Generated Alien World of Pandora.".to_string();
+                        }
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("🎲 Independent Component Rerolling:").strong());
+                ui.label("You can reroll individual components without destroying the rest of your scene:");
+
+                ui.horizontal(|ui| {
+                    if ui.button("🎲 Reroll Sky Only").clicked() {
+                        SceneGenerator::reroll_sky(rand_pseudo_u32(), &mut scene_ctrl.sky);
+                        self.status_message = "Rerolled sky without touching terrain or objects.".to_string();
+                    }
+                    if ui.button("🎲 Reroll Terrain Only").clicked() {
+                        SceneGenerator::reroll_terrain(rand_pseudo_u32(), &mut scene_ctrl.terrain);
+                        self.heightmap.generate_from_config(&scene_ctrl.terrain);
+                        self.heightmap_dirty = true;
+                        self.status_message = "Rerolled terrain without touching sky or objects.".to_string();
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🚀 Jump to 1-Click Generator Lab").clicked() {
+                        self.active_lab = ActiveLab::Generator;
+                    }
+                    if ui.button("Next: Terrain Sculpting ➡").clicked() {
+                        self.tutorial_step = 2;
+                    }
+                });
+            }
+            2 => {
+                // Step 3: Terrain & Sculpting
+                ui.heading("Step 3: Ken Musgrave Fractals & 2D Heightmap Canvas");
+                ui.label("Bryce's terrains were designed by procedural graphics pioneer Ken Musgrave. You can choose from 6 procedural noise algorithms:");
+                ui.label("• Fractional Brownian Motion (fBm): classic natural mountain ranges.\n• Ridged Multifractal: sharp mountain crests, peaks, and steep canyon gorges.\n• Billow Noise: smooth rolling sand dunes and soft hills.\n• Worley Cellular: basalt columns, rock fractures, and desert mesas.\n• Domain Warping: alien fluid swirls and folded rock strata.\n• Hybrid Multifractal: smooth valley floors transitioning into jagged cliffs.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("⛰️ Live 2D Heightmap Sculptor Canvas:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    ui.label("The Terrain Lab includes a live 2D elevation canvas. Left-click and drag on the map with procedural brushes to sculpt hills and valleys in real time:");
+                    ui.label("• ⬆️ Raise / ⬇️ Lower: directly elevate or depress the landscape.\n• 🌊 Smooth: blend harsh spikes into gentle plateaus.\n• ⏹️ Flatten: level terrain to a specific altitude plane.\n• 🎲 Noise: inject rough procedural micro-relief.");
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("🌧️ Geological Erosion Passes:").strong());
+                ui.label("Simulate natural weathering processes with a single click:");
+
+                ui.horizontal(|ui| {
+                    if ui.button("🌧️ Apply Hydraulic Rain Erosion").clicked() {
+                        self.heightmap.simulate_hydraulic_erosion(4);
+                        self.heightmap_dirty = true;
+                        self.status_message = "Applied 4 cycles of hydraulic rainfall & silt deposition.".to_string();
+                    }
+                    if ui.button("🪨 Apply Thermal Scree Weathering").clicked() {
+                        self.heightmap.simulate_thermal_erosion(4);
+                        self.heightmap_dirty = true;
+                        self.status_message = "Applied 4 cycles of thermal slope breakdown.".to_string();
+                    }
+                    if ui.button("🔄 Invert Heights").clicked() {
+                        for v in &mut self.heightmap.data {
+                            *v = -*v;
+                        }
+                        self.heightmap_dirty = true;
+                        self.status_message = "Inverted terrain (valleys became peaks).".to_string();
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🚀 Jump to Terrain Lab & Sculptor").clicked() {
+                        self.active_lab = ActiveLab::Terrain;
+                    }
+                    if ui.button("Next: Sky & Atmosphere ➡").clicked() {
+                        self.tutorial_step = 3;
+                    }
+                });
+            }
+            3 => {
+                // Step 4: Sky & Atmosphere
+                ui.heading("Step 4: Sky Lab, Atmospheric Volumetrics & Celestial Dials");
+                ui.label("Bryce's atmosphere is a physical volumetric simulation of light scattering through planetary air:");
+                ui.label("• Rayleigh Scattering: Wavelength-selective scattering that creates deep azure blue zenith skies and fiery golden/red sunset horizons.\n• Mie Scattering: Aerosol particle scattering producing the intense solar corona glow, flare, and disc halo.\n• Volumetric Fog & Haze: Height-based ground fog and distance atmospheric perspective that provides majestic scale.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("☀️ Celestial Mechanics Shortcuts:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    ui.label("• Arrow Left / Right: Rotate Sun Azimuth 360° across the horizon.\n• Arrow Up / Down: Adjust Sun Elevation from dawn to high noon to twilight.");
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("🌅 Try Atmospheric Presets:").strong());
+
+                ui.horizontal(|ui| {
+                    if ui.button("🌅 Bryce 90s Sunset").clicked() {
+                        scene_ctrl.sky = crate::sky::SkyConfig::bryce_sunset();
+                        self.status_message = "Applied Bryce 90s Sunset sky preset.".to_string();
+                    }
+                    if ui.button("☀️ Clear Midday").clicked() {
+                        scene_ctrl.sky = crate::sky::SkyConfig::clear_blue();
+                        self.status_message = "Applied Clear Blue Midday sky preset.".to_string();
+                    }
+                    if ui.button("⚡ Dramatic Storm").clicked() {
+                        scene_ctrl.sky = crate::sky::SkyConfig::dramatic_storm();
+                        self.status_message = "Applied Dramatic Storm sky preset.".to_string();
+                    }
+                    if ui.button("🌌 Starry Night").clicked() {
+                        scene_ctrl.sky = crate::sky::SkyConfig::starry_night();
+                        self.status_message = "Applied Starry Night sky preset.".to_string();
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🚀 Jump to Sky Lab").clicked() {
+                        self.active_lab = ActiveLab::Sky;
+                    }
+                    if ui.button("Next: Water & Ocean ➡").clicked() {
+                        self.tutorial_step = 4;
+                    }
+                });
+            }
+            4 => {
+                // Step 5: Water & Ocean
+                ui.heading("Step 5: Infinite Water Plane & Ocean Physics");
+                ui.label("Water in Bryce is an infinite ocean plane with procedural waves and physical optics:");
+                ui.label("• Multi-Component Gerstner Waves: Procedural sinusoidal wave displacement with controllable amplitude, frequency, and drift speed.\n• Physical Fresnel Reflections: At shallow grazing angles, water acts as a mirror reflecting the sky and mountains; at perpendicular view angles it reveals seabed depths.\n• Beer-Lambert Extinction: Light absorption causes water to transition naturally from turquoise shallows to deep navy abysses.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("🌊 Try Ocean Presets:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    ui.horizontal(|ui| {
+                        if ui.button("🌊 Open Ocean Waves").clicked() {
+                            scene_ctrl.water = crate::water::WaterConfig::ocean();
+                            self.status_message = "Configured Open Ocean with Gerstner waves.".to_string();
+                        }
+                        if ui.button("🪞 Calm Mirror Glass").clicked() {
+                            scene_ctrl.water = crate::water::WaterConfig::calm_mirror();
+                            self.status_message = "Configured Calm Mirror-like water surface.".to_string();
+                        }
+                        if ui.button("🧪 Alien Bioluminescent").clicked() {
+                            scene_ctrl.water = crate::water::WaterConfig::alien_liquid();
+                            self.status_message = "Configured Alien Bioluminescent liquid.".to_string();
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🚀 Jump to Water Lab").clicked() {
+                        self.active_lab = ActiveLab::Water;
+                    }
+                    if ui.button("Next: Materials & DTE ➡").clicked() {
+                        self.tutorial_step = 5;
+                    }
+                });
+            }
+            5 => {
+                // Step 6: Materials & DTE
+                ui.heading("Step 6: Deep Texture Editor (DTE) & 3D Spatial Texturing");
+                ui.label("Bryce revolutionized 3D CGI with the Deep Texture Editor (DTE). Instead of wrapping 2D image textures around objects, DTE materials evaluate continuously in 3D object and world space $(X, Y, Z)$:");
+                ui.label("• Zero UV Unwrapping: No texture stretching, pinching at poles, or visible seam lines!\n• Optical Parameters: Base and Secondary color ramps, roughness, metallic, reflectivity (mirror bounces), transparency, and physical Index of Refraction (IOR).\n• Procedural Bump Relief: Surface normal perturbations evaluated via spatial gradient estimation without requiring normal map files.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("🔮 Central Orb Material Quick-Swap:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    ui.label("Press keys [1] through [8] anytime to instantly swap the material on the central showcase orb, or test them here:");
+                    ui.horizontal(|ui| {
+                        if ui.button("1: 🪨 Rock").clicked() {
+                            materials[1] = GpuMaterial::rock();
+                            *material_dirty = true;
+                            self.status_message = "Applied Mountain Rock material.".to_string();
+                        }
+                        if ui.button("3: 🪞 90s Chrome").clicked() {
+                            materials[1] = GpuMaterial::chrome();
+                            *material_dirty = true;
+                            self.status_message = "Applied 90s Mirror Chrome material.".to_string();
+                        }
+                        if ui.button("4: 💎 Emerald Glass").clicked() {
+                            materials[1] = GpuMaterial::emerald_glass();
+                            *material_dirty = true;
+                            self.status_message = "Applied Emerald Glass material.".to_string();
+                        }
+                        if ui.button("8: 🪐 Bioluminescent").clicked() {
+                            materials[1] = GpuMaterial::alien_bioluminescent();
+                            *material_dirty = true;
+                            self.status_message = "Applied Bioluminescent Coral material.".to_string();
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🚀 Jump to Materials Lab & DTE").clicked() {
+                        self.active_lab = ActiveLab::Materials;
+                    }
+                    if ui.button("Next: 3D Objects & CSG ➡").clicked() {
+                        self.tutorial_step = 6;
+                    }
+                });
+            }
+            6 => {
+                // Step 7: Scene Objects & CSG
+                ui.heading("Step 7: 3D Scene Composition & CSG Booleans");
+                ui.label("Bryce allows composing intricate geometric forms using 3D primitives and Constructive Solid Geometry (CSG):");
+                ui.label("• Primitives: Spheres, Cubes, Cylinders, and Toruses with full 3-axis Position, Rotation (Pitch, Yaw, Roll), and Scale.\n• Constructive Solid Geometry (CSG):\n  - Positive (Solid Union): standard solid object.\n  - Negative (Subtractive Cutout): punches physical cavities through solid primitives and terrain, with inverted normals and interior cutter material inheritance!\n  - Intersecting: preserves only the overlapping boolean volume.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("➕ Try Adding Objects:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    ui.horizontal(|ui| {
+                        if ui.button("➕ Add Mirror Sphere").clicked() {
+                            objects.push(SceneObject::sphere("Tutorial Sphere", [0.0, 4.0, -8.0], 1.8, 2));
+                            self.status_message = "Added floating mirror sphere.".to_string();
+                        }
+                        if ui.button("➕ Add CSG Cutout Demo").clicked() {
+                            let mut cube = SceneObject::cube("Outer Cube", [0.0, 3.5, -6.0], [2.0, 2.0, 2.0], 0);
+                            cube.csg_op = CsgOp::Positive;
+                            let mut cutter = SceneObject::sphere("Negative Cutter", [0.0, 3.5, -6.0], 2.3, 7);
+                            cutter.csg_op = CsgOp::Negative;
+                            objects.push(cube);
+                            objects.push(cutter);
+                            self.status_message = "Added CSG Demo: Negative sphere carving hollow interior inside cube!".to_string();
+                        }
+                        if ui.button("➕ Add Golden Torus").clicked() {
+                            objects.push(SceneObject::torus("Golden Torus", [0.0, 5.0, -8.0], 3.0, 0.5, 4));
+                            self.status_message = "Added golden torus primitive.".to_string();
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🚀 Jump to Scene Objects Lab").clicked() {
+                        self.active_lab = ActiveLab::Scene;
+                    }
+                    if ui.button("Next: Scatter System ➡").clicked() {
+                        self.tutorial_step = 7;
+                    }
+                });
+            }
+            7 => {
+                // Step 8: Scatter System
+                ui.heading("Step 8: Vegetation & Rock Scatter System");
+                ui.label("Instead of placing hundreds of trees and boulders by hand, Bryce provides an automated procedural scatter system:");
+                ui.label("• Altitude Masking: Set min and max elevation to ensure trees only grow in fertile valleys and don't spawn underwater or on snow peaks.\n• Slope Filtering: Restrict scatter to gentler slopes (e.g. max 35°), preventing trees from clinging to vertical sheer cliffs.\n• Density Controls: Independently adjust rock boulder density and pine tree spire density.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("🌲 Scatter Simulation:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    if ui.button("🎲 Scatter Rocks & Trees across Terrain").clicked() {
+                        let scattered = self.scatter_config.scatter_objects(&scene_ctrl.terrain);
+                        let count = scattered.len();
+                        objects.extend(scattered);
+                        self.status_message = format!("Generated and scattered {} vegetation spires and rock boulders across terrain.", count);
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button("🚀 Jump to Scene Lab Scatter Controls").clicked() {
+                        self.active_lab = ActiveLab::Scene;
+                    }
+                    if ui.button("Next: Render & Export ➡").clicked() {
+                        self.tutorial_step = 8;
+                    }
+                });
+            }
+            8 => {
+                // Step 9: Render & Export
+                ui.heading("Step 9: Render Lab, Retro 1990s CGI & Project Export");
+                ui.label("You're ready to render and export your artwork! Bryce supports both modern high-fidelity rendering and authentic retro CGI aesthetics:");
+                ui.label("• Retro 1990s CGI Mode: Emulates the punchy contrast, vibrant saturated color, and 16-bit / 24-bit color quantization of legendary 90s CGI renderers.\n• Render Quality Presets: Interactive Preview, Draft, Standard, High Quality, and Maximum Production.\n• Native Project Serialization: Save and restore entire worlds using human-readable .bryce.json project files.\n• 3D Mesh & Heightmap Export: Export 3D OBJ meshes and PNG elevation maps for external DCC software.");
+
+                ui.group(|ui| {
+                    ui.label(RichText::new("🎥 Render Lab Quick Actions:").strong().color(Color32::from_rgb(0, 220, 240)));
+                    ui.horizontal(|ui| {
+                        let retro_text = if scene_ctrl.postprocess.retro_90s_cgi { "Disable 90s Retro CGI" } else { "📺 Enable 90s Retro CGI" };
+                        if ui.button(retro_text).clicked() {
+                            scene_ctrl.postprocess.retro_90s_cgi = !scene_ctrl.postprocess.retro_90s_cgi;
+                            self.status_message = format!("Retro 1990s CGI mode set to {}", scene_ctrl.postprocess.retro_90s_cgi);
+                        }
+                        if ui.button("💾 Save Project (.bryce.json)").clicked() {
+                            let proj = ProjectFile {
+                                name: "My Bryce Studio World".to_string(),
+                                version: "7.0.0".to_string(),
+                                terrain: scene_ctrl.terrain.clone(),
+                                sky: scene_ctrl.sky.clone(),
+                                water: scene_ctrl.water.clone(),
+                                materials: materials.to_vec(),
+                                objects: objects.clone(),
+                                postprocess: scene_ctrl.postprocess.clone(),
+                            };
+                            let path = "my_bryce_world.bryce.json";
+                            match ProjectIO::save_project(path, &proj) {
+                                Ok(_) => self.status_message = format!("Saved project to {}", path),
+                                Err(e) => self.status_message = format!("Save error: {}", e),
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.label(RichText::new("🎉 You are now fully trained in Bryce 7 Pro Studio! Enjoy creating surreal landscapes and photorealistic worlds.").strong().color(Color32::from_rgb(0, 230, 160)));
+
+                ui.horizontal(|ui| {
+                    if ui.button("🚀 Open Render & Export Lab").clicked() {
+                        self.active_lab = ActiveLab::Render;
+                    }
+                    if ui.button("🔄 Restart Tutorial from Step 1").clicked() {
+                        self.tutorial_step = 0;
+                    }
+                });
+            }
+            _ => {}
+        }
     }
 
     // -------------------------------------------------------------------------
