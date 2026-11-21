@@ -10,6 +10,7 @@ pub enum PrimitiveType {
     Pyramid,
     Torus,
     Plane,
+    Mesh,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,7 @@ pub struct SceneObject {
     pub scale: [f32; 3],
     pub material_id: u32,
     pub visible: bool,
+    pub mesh_id: Option<usize>,
 }
 
 impl SceneObject {
@@ -42,6 +44,7 @@ impl SceneObject {
             scale: [radius, radius, radius],
             material_id,
             visible: true,
+            mesh_id: None,
         }
     }
 
@@ -55,6 +58,7 @@ impl SceneObject {
             scale: half_extents,
             material_id,
             visible: true,
+            mesh_id: None,
         }
     }
 
@@ -68,6 +72,7 @@ impl SceneObject {
             scale: [major_rad, tube_rad, major_rad],
             material_id,
             visible: true,
+            mesh_id: None,
         }
     }
 
@@ -81,6 +86,121 @@ impl SceneObject {
             scale: [radius, height, radius],
             material_id,
             visible: true,
+            mesh_id: None,
+        }
+    }
+
+    pub fn mesh(name: &str, pos: [f32; 3], scale: [f32; 3], material_id: u32, mesh_id: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            primitive: PrimitiveType::Mesh,
+            csg_op: CsgOp::Positive,
+            position: pos,
+            rotation: [0.0, 0.0, 0.0],
+            scale,
+            material_id,
+            visible: true,
+            mesh_id: Some(mesh_id),
+        }
+    }
+
+    /// Intersect an arbitrary world ray against this object for viewport clicking & selection
+    pub fn intersect_ray(&self, ro: glam::Vec3, rd: glam::Vec3) -> Option<f32> {
+        if !self.visible {
+            return None;
+        }
+
+        let center = glam::Vec3::from(self.position);
+        let scale = glam::Vec3::from(self.scale);
+
+        // Transform ray into local object coordinate space with rotation
+        let rad_x = self.rotation[0].to_radians();
+        let rad_y = self.rotation[1].to_radians();
+        let rad_z = self.rotation[2].to_radians();
+
+        let rot_mat = glam::Mat3::from_rotation_z(rad_z)
+            * glam::Mat3::from_rotation_y(rad_y)
+            * glam::Mat3::from_rotation_x(rad_x);
+        let inv_rot = rot_mat.transpose();
+
+        let ro_local = inv_rot * (ro - center);
+        let rd_local = (inv_rot * rd).normalize();
+
+        match self.primitive {
+            PrimitiveType::Sphere => {
+                let rad = scale.x;
+                let b = ro_local.dot(rd_local);
+                let c = ro_local.dot(ro_local) - rad * rad;
+                let disc = b * b - c;
+                if disc > 0.0 {
+                    let t = -b - disc.sqrt();
+                    if t > 0.05 {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            PrimitiveType::Cube => {
+                let min = -scale;
+                let max = scale;
+                let inv_d = glam::Vec3::new(
+                    1.0 / rd_local.x.abs().max(1e-6) * rd_local.x.signum(),
+                    1.0 / rd_local.y.abs().max(1e-6) * rd_local.y.signum(),
+                    1.0 / rd_local.z.abs().max(1e-6) * rd_local.z.signum(),
+                );
+                let t0s = (min - ro_local) * inv_d;
+                let t1s = (max - ro_local) * inv_d;
+                let t_min = t0s.min(t1s).max_element();
+                let t_max = t0s.max(t1s).min_element();
+                if t_max >= t_min.max(0.05) {
+                    Some(t_min)
+                } else {
+                    None
+                }
+            }
+            PrimitiveType::Cylinder => {
+                let rad = scale.x;
+                let half_h = scale.y;
+                let a = rd_local.x * rd_local.x + rd_local.z * rd_local.z;
+                let b = ro_local.x * rd_local.x + ro_local.z * rd_local.z;
+                let c = ro_local.x * ro_local.x + ro_local.z * ro_local.z - rad * rad;
+                let disc = b * b - a * c;
+                if disc > 0.0 && a > 0.0001 {
+                    let t = (-b - disc.sqrt()) / a;
+                    let y = ro_local.y + rd_local.y * t;
+                    if t > 0.05 && y.abs() <= half_h {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            PrimitiveType::Torus => {
+                let bound_r = scale.x + scale.y;
+                let b = ro_local.dot(rd_local);
+                let c = ro_local.dot(ro_local) - bound_r * bound_r;
+                let disc = b * b - c;
+                if disc > 0.0 {
+                    let t = -b - disc.sqrt();
+                    if t > 0.05 {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            PrimitiveType::Mesh | PrimitiveType::Cone | PrimitiveType::Pyramid | PrimitiveType::Plane => {
+                // Bounding sphere/box hit test for picking
+                let max_dim = scale.max_element().max(0.5);
+                let b = ro_local.dot(rd_local);
+                let c = ro_local.dot(ro_local) - max_dim * max_dim * 1.5;
+                let disc = b * b - c;
+                if disc > 0.0 {
+                    let t = -b - disc.sqrt();
+                    if t > 0.05 {
+                        return Some(t);
+                    }
+                }
+                None
+            }
         }
     }
 }

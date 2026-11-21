@@ -50,20 +50,28 @@ struct GpuMaterial {
 };
 
 struct GpuPrimitive {
-    // x, y, z: position, w: primitive_type (0: Sphere, 1: Cube, 2: Cylinder, 3: Torus)
+    // x, y, z: position, w: primitive_type (0: Sphere, 1: Cube, 2: Cylinder, 3: Torus, 4: Cone, 5: Pyramid, 6: Mesh)
     pos_and_type: vec4<f32>,
     // x, y, z: scale/dimensions, w: material_id
     scale_and_mat: vec4<f32>,
     // x, y, z: rotation (deg), w: csg_op (0: Positive, 1: Negative, 2: Intersecting)
     rot_and_csg: vec4<f32>,
-    // x: visible (1.0 or 0.0), y, z, w: padding
+    // x: visible (1.0 or 0.0), y: tri_offset, z: tri_count, w: padding
     extra: vec4<f32>,
+};
+
+struct GpuTriangle {
+    v0: vec4<f32>,
+    v1: vec4<f32>,
+    v2: vec4<f32>,
+    normal: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var<uniform> scene: SceneUniform;
 @group(0) @binding(2) var<uniform> materials: array<GpuMaterial, 16>;
-@group(0) @binding(3) var<uniform> primitives: array<GpuPrimitive, 8>;
+@group(0) @binding(3) var<uniform> primitives: array<GpuPrimitive, 32>;
+@group(0) @binding(4) var<storage, read> mesh_triangles: array<GpuTriangle>;
 
 // Full-screen triangle vertex shader
 struct VertexOutput {
@@ -480,9 +488,9 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
         }
     }
 
-    // 2. Dynamic Primitives (Spheres, Cubes, Cylinders, Toruses)
+    // 2. Dynamic Primitives (Spheres, Cubes, Cylinders, Toruses, Meshes)
     let num_prims = u32(scene.resolution.w + 0.5);
-    for (var i = 0u; i < 8u; i = i + 1u) {
+    for (var i = 0u; i < 32u; i = i + 1u) {
         if (i >= num_prims) { break; }
         let prim = primitives[i];
         if (prim.extra.x < 0.5) { continue; } // not visible
@@ -610,12 +618,60 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
                     t_tor = t_tor + dist * 0.6;
                 }
             }
+        } else if (prim_type == 6u) {
+            // MESH / 3D MODEL (AABB Bounding Box culling + Möller–Trumbore ray-triangle intersection)
+            let box_min = -scale;
+            let box_max = scale;
+            let inv_d = 1.0 / rd_local;
+            let t0s = (box_min - ro_local) * inv_d;
+            let t1s = (box_max - ro_local) * inv_d;
+            let t_min = max(max(min(t0s.x, t1s.x), min(t0s.y, t1s.y)), min(t0s.z, t1s.z));
+            let t_max = min(min(max(t0s.x, t1s.x), max(t0s.y, t1s.y)), max(t0s.z, t1s.z));
+
+            if (t_max >= max(0.05, t_min) && t_min < closest.t) {
+                let tri_start = u32(prim.extra.y + 0.5);
+                let tri_count = u32(prim.extra.z + 0.5);
+
+                for (var t_idx = 0u; t_idx < tri_count; t_idx = t_idx + 1u) {
+                    let tri = mesh_triangles[tri_start + t_idx];
+                    let v0 = tri.v0.xyz;
+                    let v1 = tri.v1.xyz;
+                    let v2 = tri.v2.xyz;
+
+                    let edge1 = v1 - v0;
+                    let edge2 = v2 - v0;
+                    let pvec = cross(rd_local, edge2);
+                    let det = dot(edge1, pvec);
+
+                    if (abs(det) > 0.00001) {
+                        let inv_det = 1.0 / det;
+                        let tvec = ro_local - v0;
+                        let u = dot(tvec, pvec) * inv_det;
+                        if (u >= 0.0 && u <= 1.0) {
+                            let qvec = cross(tvec, edge1);
+                            let v = dot(rd_local, qvec) * inv_det;
+                            if (v >= 0.0 && (u + v) <= 1.0) {
+                                let t_hit = dot(edge2, qvec) * inv_det;
+                                if (t_hit > 0.05 && t_hit < closest.t) {
+                                    closest.hit = true;
+                                    closest.t = t_hit;
+                                    closest.pos = ro + rd * t_hit;
+                                    let n_world = normalize(rotate_x(rotate_y(rotate_z(tri.normal.xyz, rad_rot.z), rad_rot.y), rad_rot.x));
+                                    closest.normal = n_world;
+                                    closest.mat_id = mat_id;
+                                    closest.is_water = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     // Subtractive CSG Pass (Negative cutouts punch holes into solids)
     if (closest.hit && !closest.is_water) {
-        for (var i = 0u; i < 8u; i = i + 1u) {
+        for (var i = 0u; i < 32u; i = i + 1u) {
             if (i >= num_prims) { break; }
             let prim = primitives[i];
             if (prim.extra.x < 0.5) { continue; }

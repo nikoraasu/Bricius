@@ -33,6 +33,11 @@ pub struct State {
     pub objects: Vec<SceneObject>,
     pub primitives_buffer: wgpu::Buffer,
 
+    pub meshes: Vec<crate::model_loader::LoadedMesh>,
+    pub mesh_triangles_buffer: wgpu::Buffer,
+    pub mesh_dirty: bool,
+
+    pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
 
     pub start_time: Instant,
@@ -45,9 +50,12 @@ pub struct State {
     pub egui_renderer: egui_wgpu::Renderer,
     pub editor: EditorState,
 
-    // Input tracking
+    // Input tracking & 3D Viewport Transform Dragging
     pub keys_pressed: std::collections::HashSet<winit::keyboard::KeyCode>,
     pub mouse_pressed: bool,
+    pub dragging_object: bool,
+    pub drag_start_obj_pos: glam::Vec3,
+    pub drag_start_mouse: glam::Vec2,
     pub last_mouse_pos: Option<(f64, f64)>,
 }
 
@@ -152,14 +160,17 @@ impl State {
             scale_and_mat: [0.0; 4],
             rot_and_csg: [0.0; 4],
             extra: [0.0; 4],
-        }; 8];
+        }; 32];
 
-        for (i, obj) in objects.iter().enumerate().take(8) {
+        for (i, obj) in objects.iter().enumerate().take(32) {
             let prim_type = match obj.primitive {
                 PrimitiveType::Sphere => 0.0,
                 PrimitiveType::Cube => 1.0,
                 PrimitiveType::Cylinder => 2.0,
                 PrimitiveType::Torus => 3.0,
+                PrimitiveType::Cone => 4.0,
+                PrimitiveType::Pyramid => 5.0,
+                PrimitiveType::Mesh => 6.0,
                 _ => 0.0,
             };
             gpu_prims[i] = GpuPrimitive {
@@ -176,7 +187,48 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // Create Bind Group Layout (4 bindings)
+        // Initialize Built-in Mesh Models
+        let meshes = vec![
+            crate::model_loader::ModelLoader::bryce_teapot(),
+            crate::model_loader::ModelLoader::obelisk_monolith(),
+            crate::model_loader::ModelLoader::crystal_geode(),
+            crate::model_loader::ModelLoader::starfighter_ship(),
+        ];
+
+        let mut gpu_triangles = Vec::new();
+        for (mesh_idx, mesh) in meshes.iter().enumerate() {
+            let num_triangles = mesh.indices.len() / 3;
+            for t in 0..num_triangles {
+                let i0 = mesh.indices[t * 3] as usize;
+                let i1 = mesh.indices[t * 3 + 1] as usize;
+                let i2 = mesh.indices[t * 3 + 2] as usize;
+                if i0 < mesh.vertices.len() && i1 < mesh.vertices.len() && i2 < mesh.vertices.len() {
+                    let n = if i0 < mesh.normals.len() { mesh.normals[i0] } else { [0.0, 1.0, 0.0] };
+                    gpu_triangles.push(crate::scene::GpuTriangle {
+                        v0: [mesh.vertices[i0][0], mesh.vertices[i0][1], mesh.vertices[i0][2], mesh_idx as f32],
+                        v1: [mesh.vertices[i1][0], mesh.vertices[i1][1], mesh.vertices[i1][2], 0.0],
+                        v2: [mesh.vertices[i2][0], mesh.vertices[i2][1], mesh.vertices[i2][2], 0.0],
+                        normal: [n[0], n[1], n[2], 0.0],
+                    });
+                }
+            }
+        }
+        if gpu_triangles.is_empty() {
+            gpu_triangles.push(crate::scene::GpuTriangle {
+                v0: [0.0; 4],
+                v1: [0.0; 4],
+                v2: [0.0; 4],
+                normal: [0.0, 1.0, 0.0, 0.0],
+            });
+        }
+
+        let mesh_triangles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Mesh Triangles Buffer"),
+            contents: bytemuck::cast_slice(&gpu_triangles),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Create Bind Group Layout (5 bindings)
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Main Bind Group Layout"),
             entries: &[
@@ -220,6 +272,16 @@ impl State {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -242,6 +304,10 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: primitives_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: mesh_triangles_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -333,6 +399,10 @@ impl State {
             material_dirty: false,
             objects,
             primitives_buffer,
+            meshes,
+            mesh_triangles_buffer,
+            mesh_dirty: false,
+            bind_group_layout,
             bind_group,
             start_time: Instant::now(),
             last_frame_time: Instant::now(),
@@ -343,8 +413,74 @@ impl State {
             editor,
             keys_pressed: std::collections::HashSet::new(),
             mouse_pressed: false,
+            dragging_object: false,
+            drag_start_obj_pos: glam::Vec3::ZERO,
+            drag_start_mouse: glam::Vec2::ZERO,
             last_mouse_pos: None,
         }
+    }
+
+    pub fn rebuild_mesh_buffer(&mut self) {
+        let mut gpu_triangles = Vec::new();
+        for (mesh_idx, mesh) in self.meshes.iter().enumerate() {
+            let num_triangles = mesh.indices.len() / 3;
+            for t in 0..num_triangles {
+                let i0 = mesh.indices[t * 3] as usize;
+                let i1 = mesh.indices[t * 3 + 1] as usize;
+                let i2 = mesh.indices[t * 3 + 2] as usize;
+                if i0 < mesh.vertices.len() && i1 < mesh.vertices.len() && i2 < mesh.vertices.len() {
+                    let n = if i0 < mesh.normals.len() { mesh.normals[i0] } else { [0.0, 1.0, 0.0] };
+                    gpu_triangles.push(crate::scene::GpuTriangle {
+                        v0: [mesh.vertices[i0][0], mesh.vertices[i0][1], mesh.vertices[i0][2], mesh_idx as f32],
+                        v1: [mesh.vertices[i1][0], mesh.vertices[i1][1], mesh.vertices[i1][2], 0.0],
+                        v2: [mesh.vertices[i2][0], mesh.vertices[i2][1], mesh.vertices[i2][2], 0.0],
+                        normal: [n[0], n[1], n[2], 0.0],
+                    });
+                }
+            }
+        }
+        if gpu_triangles.is_empty() {
+            gpu_triangles.push(crate::scene::GpuTriangle {
+                v0: [0.0; 4],
+                v1: [0.0; 4],
+                v2: [0.0; 4],
+                normal: [0.0, 1.0, 0.0, 0.0],
+            });
+        }
+
+        self.mesh_triangles_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Mesh Triangles Buffer"),
+            contents: bytemuck::cast_slice(&gpu_triangles),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Main Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.scene_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.materials_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.primitives_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.mesh_triangles_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        self.mesh_dirty = false;
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -422,9 +558,9 @@ impl State {
             scale_and_mat: [0.0; 4],
             rot_and_csg: [0.0; 4],
             extra: [0.0; 4],
-        }; 8];
+        }; 32];
 
-        let count = self.objects.len().min(8);
+        let count = self.objects.len().min(32);
         for i in 0..count {
             let obj = &self.objects[i];
             let prim_type = match obj.primitive {
@@ -432,13 +568,31 @@ impl State {
                 PrimitiveType::Cube => 1.0,
                 PrimitiveType::Cylinder => 2.0,
                 PrimitiveType::Torus => 3.0,
+                PrimitiveType::Cone => 4.0,
+                PrimitiveType::Pyramid => 5.0,
+                PrimitiveType::Mesh => 6.0,
                 _ => 0.0,
             };
+
+            let (tri_offset, tri_count) = if let Some(mesh_idx) = obj.mesh_id {
+                let mut offset = 0;
+                for (m_i, m) in self.meshes.iter().enumerate() {
+                    if m_i == mesh_idx {
+                        break;
+                    }
+                    offset += m.indices.len() / 3;
+                }
+                let c = self.meshes.get(mesh_idx).map(|m| m.indices.len() / 3).unwrap_or(0);
+                (offset as f32, c as f32)
+            } else {
+                (0.0, 0.0)
+            };
+
             gpu_prims[i] = GpuPrimitive {
                 pos_and_type: [obj.position[0], obj.position[1], obj.position[2], prim_type],
                 scale_and_mat: [obj.scale[0], obj.scale[1], obj.scale[2], obj.material_id as f32],
                 rot_and_csg: [obj.rotation[0], obj.rotation[1], obj.rotation[2], obj.csg_op as u32 as f32],
-                extra: [if obj.visible { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+                extra: [if obj.visible { 1.0 } else { 0.0 }, tri_offset, tri_count, 0.0],
             };
         }
         self.queue.write_buffer(&self.primitives_buffer, 0, bytemuck::cast_slice(&gpu_prims));
@@ -490,15 +644,23 @@ impl State {
         let raw_input = self.egui_winit_state.take_egui_input(&self.window);
         self.egui_ctx.begin_pass(raw_input);
         let mut mat_dirty = self.material_dirty;
+        let mut mesh_dirty = self.mesh_dirty;
         self.editor.draw(
             &self.egui_ctx,
             &mut self.scene_ctrl,
             &mut self.camera,
             &mut self.materials,
             &mut self.objects,
+            &mut self.meshes,
             &mut mat_dirty,
+            &mut mesh_dirty,
         );
         self.material_dirty = mat_dirty;
+        self.mesh_dirty = mesh_dirty;
+
+        if self.mesh_dirty {
+            self.rebuild_mesh_buffer();
+        }
         let full_output = self.egui_ctx.end_pass();
 
         // If user changed materials in UI, write to GPU uniform buffer immediately

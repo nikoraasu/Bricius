@@ -46,14 +46,23 @@ pub struct SceneUniform {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuPrimitive {
-    // x, y, z: position, w: primitive_type (0: Sphere, 1: Cube, 2: Cylinder, 3: Torus)
+    // x, y, z: position, w: primitive_type (0: Sphere, 1: Cube, 2: Cylinder, 3: Torus, 4: Cone, 5: Pyramid, 6: Mesh)
     pub pos_and_type: [f32; 4],
     // x, y, z: scale/dimensions, w: material_id
     pub scale_and_mat: [f32; 4],
     // x, y, z: rotation (deg), w: csg_op (0: Positive, 1: Negative, 2: Intersecting)
     pub rot_and_csg: [f32; 4],
-    // x: visible (1.0 or 0.0), y, z, w: padding
+    // x: visible (1.0 or 0.0), y: tri_offset, z: tri_count, w: padding
     pub extra: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuTriangle {
+    pub v0: [f32; 4],     // x, y, z, mesh_id
+    pub v1: [f32; 4],     // x, y, z, material_id
+    pub v2: [f32; 4],     // x, y, z, padding
+    pub normal: [f32; 4], // nx, ny, nz, padding
 }
 
 pub struct SceneController {

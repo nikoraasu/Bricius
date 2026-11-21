@@ -75,6 +75,12 @@ pub struct EditorState {
     pub tutorial_step: usize,
     pub show_controls_hud: bool,
     pub request_render: bool,
+    pub material_names: [String; GpuMaterial::NUM_PRESETS],
+    #[allow(dead_code)]
+    pub custom_mat_name_input: String,
+    pub model_file_path_input: String,
+    pub uniform_scale_locked: bool,
+    pub copied_material: Option<GpuMaterial>,
     pub status_message: String,
     pub fps: f32,
     pub frame_time_ms: f32,
@@ -84,6 +90,25 @@ impl EditorState {
     pub fn new() -> Self {
         let mut heightmap = HeightmapGrid::new(128);
         heightmap.generate_from_config(&crate::terrain::TerrainConfig::default());
+
+        let material_names = [
+            "Mountain Rock".to_string(),
+            "Blue Marble".to_string(),
+            "Mirror Chrome".to_string(),
+            "Emerald Glass".to_string(),
+            "Hammered Gold".to_string(),
+            "Basalt Obsidian".to_string(),
+            "Ocean Water".to_string(),
+            "Bioluminescent".to_string(),
+            "Bryce Plastic".to_string(),
+            "Sandstone Strata".to_string(),
+            "Glacial Ice".to_string(),
+            "Wood Grain".to_string(),
+            "Rusted Iron".to_string(),
+            "Amethyst Crystal".to_string(),
+            "Cyber Grid".to_string(),
+            "Red Desert Rock".to_string(),
+        ];
 
         Self {
             visible: true,
@@ -101,6 +126,11 @@ impl EditorState {
             tutorial_step: 0,
             show_controls_hud: true,
             request_render: false,
+            material_names,
+            custom_mat_name_input: String::new(),
+            model_file_path_input: String::new(),
+            uniform_scale_locked: true,
+            copied_material: None,
             status_message: "Welcome to Bryce 7 Pro Studio! Follow the tutorial or press F1 anytime.".to_string(),
             fps: 60.0,
             frame_time_ms: 16.6,
@@ -114,7 +144,9 @@ impl EditorState {
         camera: &mut Camera,
         materials: &mut [GpuMaterial; GpuMaterial::NUM_PRESETS],
         objects: &mut Vec<SceneObject>,
+        meshes: &mut Vec<crate::model_loader::LoadedMesh>,
         material_dirty: &mut bool,
+        mesh_dirty: &mut bool,
     ) {
         if !self.visible {
             egui::Area::new(egui::Id::new("minimized_bar"))
@@ -321,10 +353,10 @@ impl EditorState {
                         self.draw_water_lab(ui, scene_ctrl);
                     }
                     ActiveLab::Materials => {
-                        self.draw_materials_lab(ui, materials, scene_ctrl, material_dirty);
+                        self.draw_materials_lab(ui, materials, objects, scene_ctrl, material_dirty);
                     }
                     ActiveLab::Scene => {
-                        self.draw_scene_lab(ui, scene_ctrl, objects);
+                        self.draw_scene_lab(ui, scene_ctrl, objects, meshes, camera, mesh_dirty);
                     }
                     ActiveLab::Render => {
                         self.draw_render_lab(ui, scene_ctrl, camera, materials, objects);
@@ -332,6 +364,11 @@ impl EditorState {
                 }
             });
         });
+
+        // =========================================================================
+        // 3D VIEWPORT SELECTION BRACKETS & TRANSFORM GIZMO OVERLAY
+        // =========================================================================
+        self.draw_viewport_gizmo(ctx, camera, objects, screen.width(), screen.height());
 
         // =========================================================================
         // BOTTOM STATUS BAR
@@ -1192,27 +1229,77 @@ impl EditorState {
         &mut self,
         ui: &mut Ui,
         materials: &mut [GpuMaterial; GpuMaterial::NUM_PRESETS],
+        objects: &mut [SceneObject],
         scene_ctrl: &mut SceneController,
         material_dirty: &mut bool,
     ) {
-        ui.heading("Active Material Slot");
+        ui.heading("Custom Material Studio & DTE");
+
         ui.horizontal(|ui| {
+            let slot_name = &self.material_names[self.selected_material_slot];
             egui::ComboBox::from_label("")
-                .selected_text(format!("Material Slot {}", self.selected_material_slot))
+                .selected_text(format!("Slot {}: {}", self.selected_material_slot, slot_name))
                 .show_ui(ui, |ui| {
                     for i in 0..GpuMaterial::NUM_PRESETS {
-                        ui.selectable_value(&mut self.selected_material_slot, i, format!("Slot {}: Material", i));
+                        ui.selectable_value(
+                            &mut self.selected_material_slot,
+                            i,
+                            format!("Slot {}: {}", i, self.material_names[i]),
+                        );
                     }
                 });
 
-            if ui.button("Apply to Target Orb").clicked() {
+            if !objects.is_empty() && self.selected_object_idx < objects.len() {
+                let obj_name = &objects[self.selected_object_idx].name;
+                if ui.button(RichText::new(format!("🎯 Assign to '{}'", obj_name)).color(Color32::from_rgb(0, 230, 255)).strong()).clicked() {
+                    objects[self.selected_object_idx].material_id = self.selected_material_slot as u32;
+                    self.status_message = format!("Assigned Material Slot {} ({}) to '{}'", self.selected_material_slot, self.material_names[self.selected_material_slot], obj_name);
+                }
+            }
+
+            if ui.button("Link to Showcase Orb").clicked() {
                 scene_ctrl.selected_material = self.selected_material_slot as u32;
-                self.status_message = format!("Linked slot {} to showcase orb", self.selected_material_slot);
+                self.status_message = format!("Linked slot {} to central showcase orb", self.selected_material_slot);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Material Label:");
+            ui.text_edit_singleline(&mut self.material_names[self.selected_material_slot]);
+
+            if ui.button("📋 Copy").clicked() {
+                self.copied_material = Some(materials[self.selected_material_slot]);
+                self.status_message = format!("Copied Material Slot {} to clipboard", self.selected_material_slot);
+            }
+            if ui.button("📥 Paste").clicked() {
+                if let Some(copied) = self.copied_material {
+                    materials[self.selected_material_slot] = copied;
+                    *material_dirty = true;
+                    self.status_message = format!("Pasted copied material into Slot {}", self.selected_material_slot);
+                }
+            }
+            if ui.button("💾 Save JSON").clicked() {
+                let mat = &materials[self.selected_material_slot];
+                if let Ok(json) = serde_json::to_string_pretty(mat) {
+                    let filename = format!("custom_material_slot_{}.json", self.selected_material_slot);
+                    let _ = std::fs::write(&filename, json);
+                    self.status_message = format!("Exported material to {}", filename);
+                }
+            }
+            if ui.button("📂 Load JSON").clicked() {
+                let filename = format!("custom_material_slot_{}.json", self.selected_material_slot);
+                if let Ok(content) = std::fs::read_to_string(&filename) {
+                    if let Ok(mat) = serde_json::from_str::<GpuMaterial>(&content) {
+                        materials[self.selected_material_slot] = mat;
+                        *material_dirty = true;
+                        self.status_message = format!("Imported material from {}", filename);
+                    }
+                }
             }
         });
 
         ui.separator();
-        ui.label(RichText::new("Preset Library (One-Click)").strong());
+        ui.label(RichText::new("Preset Material Library (One-Click)").strong());
         ui.horizontal_wrapped(|ui| {
             let presets = [
                 ("Rock", GpuMaterial::rock()),
@@ -1236,6 +1323,7 @@ impl EditorState {
             for (name, mat) in presets {
                 if ui.button(name).clicked() {
                     materials[self.selected_material_slot] = mat;
+                    self.material_names[self.selected_material_slot] = name.to_string();
                     *material_dirty = true;
                     self.status_message = format!("Loaded preset '{}' into slot {}", name, self.selected_material_slot);
                 }
@@ -1344,56 +1432,107 @@ impl EditorState {
         ui: &mut Ui,
         scene_ctrl: &mut SceneController,
         objects: &mut Vec<SceneObject>,
+        meshes: &mut Vec<crate::model_loader::LoadedMesh>,
+        camera: &mut Camera,
+        mesh_dirty: &mut bool,
     ) {
-        ui.heading("3D Scene Primitives & Composition");
+        ui.heading("3D Scene Composition & Custom Models");
 
+        ui.label(RichText::new("➕ Create Geometric Primitives:").strong());
         ui.horizontal(|ui| {
-            if ui.button("➕ Add Sphere").clicked() {
-                objects.push(SceneObject::sphere(
-                    &format!("Sphere {}", objects.len() + 1),
-                    [0.0, 3.0, -6.0],
-                    1.5,
-                    scene_ctrl.selected_material,
-                ));
+            if ui.button("⚪ Sphere").clicked() {
+                let spawn_pos = [camera.position.x + camera.forward().x * 6.0, camera.position.y + camera.forward().y * 6.0, camera.position.z + camera.forward().z * 6.0];
+                objects.push(SceneObject::sphere(&format!("Sphere {}", objects.len() + 1), spawn_pos, 1.5, scene_ctrl.selected_material));
                 self.selected_object_idx = objects.len() - 1;
                 self.status_message = "Added new Sphere primitive.".to_string();
             }
-            if ui.button("➕ Add Cube").clicked() {
-                objects.push(SceneObject::cube(
-                    &format!("Cube {}", objects.len() + 1),
-                    [0.0, 2.0, -6.0],
-                    [1.0, 1.0, 1.0],
-                    scene_ctrl.selected_material,
-                ));
+            if ui.button("🧊 Cube").clicked() {
+                let spawn_pos = [camera.position.x + camera.forward().x * 6.0, camera.position.y + camera.forward().y * 6.0, camera.position.z + camera.forward().z * 6.0];
+                objects.push(SceneObject::cube(&format!("Cube {}", objects.len() + 1), spawn_pos, [1.0, 1.0, 1.0], scene_ctrl.selected_material));
                 self.selected_object_idx = objects.len() - 1;
                 self.status_message = "Added new Cube primitive.".to_string();
             }
-            if ui.button("➕ Add Cylinder").clicked() {
-                objects.push(SceneObject::cylinder(
-                    &format!("Cylinder {}", objects.len() + 1),
-                    [0.0, 2.5, -6.0],
-                    1.0,
-                    2.5,
-                    scene_ctrl.selected_material,
-                ));
+            if ui.button("🛢️ Cylinder").clicked() {
+                let spawn_pos = [camera.position.x + camera.forward().x * 6.0, camera.position.y + camera.forward().y * 6.0, camera.position.z + camera.forward().z * 6.0];
+                objects.push(SceneObject::cylinder(&format!("Cylinder {}", objects.len() + 1), spawn_pos, 1.0, 2.0, scene_ctrl.selected_material));
                 self.selected_object_idx = objects.len() - 1;
                 self.status_message = "Added new Cylinder primitive.".to_string();
             }
-            if ui.button("➕ Add Torus").clicked() {
-                objects.push(SceneObject::torus(
-                    &format!("Torus {}", objects.len() + 1),
-                    [0.0, 4.0, -6.0],
-                    2.5,
-                    0.4,
-                    scene_ctrl.selected_material,
-                ));
+            if ui.button("🍩 Torus").clicked() {
+                let spawn_pos = [camera.position.x + camera.forward().x * 6.0, camera.position.y + camera.forward().y * 6.0, camera.position.z + camera.forward().z * 6.0];
+                objects.push(SceneObject::torus(&format!("Torus {}", objects.len() + 1), spawn_pos, 2.0, 0.4, scene_ctrl.selected_material));
                 self.selected_object_idx = objects.len() - 1;
                 self.status_message = "Added new Torus primitive.".to_string();
             }
         });
 
         ui.separator();
-        ui.label(RichText::new("Scene Hierarchy").strong());
+        ui.label(RichText::new("🗿 Import & Spawn 3D Mesh Models (.obj, .glb, .fbx):").strong().color(Color32::from_rgb(0, 220, 240)));
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("🫖 Utah Teapot").clicked() {
+                let spawn_pos = [camera.position.x + camera.forward().x * 7.0, camera.position.y + camera.forward().y * 7.0, camera.position.z + camera.forward().z * 7.0];
+                objects.push(SceneObject::mesh("Bryce Utah Teapot", spawn_pos, [1.5, 1.5, 1.5], scene_ctrl.selected_material, 0));
+                self.selected_object_idx = objects.len() - 1;
+                self.status_message = "Spawned Utah Teapot model".to_string();
+            }
+            if ui.button("🏛️ Desert Monolith").clicked() {
+                let spawn_pos = [camera.position.x + camera.forward().x * 8.0, camera.position.y + camera.forward().y * 8.0, camera.position.z + camera.forward().z * 8.0];
+                objects.push(SceneObject::mesh("Desert Monolith", spawn_pos, [1.5, 1.5, 1.5], scene_ctrl.selected_material, 1));
+                self.selected_object_idx = objects.len() - 1;
+                self.status_message = "Spawned Desert Monolith model".to_string();
+            }
+            if ui.button("💎 Crystal Geode").clicked() {
+                let spawn_pos = [camera.position.x + camera.forward().x * 7.0, camera.position.y + camera.forward().y * 7.0, camera.position.z + camera.forward().z * 7.0];
+                objects.push(SceneObject::mesh("Crystal Geode", spawn_pos, [1.5, 1.5, 1.5], scene_ctrl.selected_material, 2));
+                self.selected_object_idx = objects.len() - 1;
+                self.status_message = "Spawned Crystal Geode model".to_string();
+            }
+            if ui.button("🚀 Starfighter").clicked() {
+                let spawn_pos = [camera.position.x + camera.forward().x * 8.0, camera.position.y + camera.forward().y * 8.0, camera.position.z + camera.forward().z * 8.0];
+                objects.push(SceneObject::mesh("Starfighter Interceptor", spawn_pos, [1.5, 1.5, 1.5], scene_ctrl.selected_material, 3));
+                self.selected_object_idx = objects.len() - 1;
+                self.status_message = "Spawned Starfighter model".to_string();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Model File Path:");
+            ui.add(egui::TextEdit::singleline(&mut self.model_file_path_input).hint_text("model.obj, .glb, .fbx"));
+            if ui.button("📂 Load 3D Model").clicked() {
+                let trimmed = self.model_file_path_input.trim();
+                if !trimmed.is_empty() {
+                    match crate::model_loader::ModelLoader::load_from_file(trimmed) {
+                        Ok(loaded_mesh) => {
+                            let name = loaded_mesh.name.clone();
+                            let tri_cnt = loaded_mesh.triangle_count();
+                            let mesh_idx = meshes.len();
+                            meshes.push(loaded_mesh);
+                            *mesh_dirty = true;
+                            let spawn_pos = [
+                                camera.position.x + camera.forward().x * 7.0,
+                                camera.position.y + camera.forward().y * 7.0,
+                                camera.position.z + camera.forward().z * 7.0,
+                            ];
+                            objects.push(SceneObject::mesh(
+                                &name,
+                                spawn_pos,
+                                [1.5, 1.5, 1.5],
+                                scene_ctrl.selected_material,
+                                mesh_idx,
+                            ));
+                            self.selected_object_idx = objects.len() - 1;
+                            self.status_message = format!("Successfully imported '{}' ({} triangles)", name, tri_cnt);
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Import error: {}", e);
+                        }
+                    }
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label(RichText::new("Scene Objects & Hierarchy").strong());
 
         for (i, obj) in objects.iter_mut().enumerate() {
             let is_sel = self.selected_object_idx == i;
@@ -1429,38 +1568,86 @@ impl EditorState {
                                 ui.selectable_value(&mut obj.csg_op, CsgOp::Intersecting, "Intersecting (Intersection)");
                             });
                     });
-                    ui.label("Position (X, Y, Z):");
+
                     ui.horizontal(|ui| {
+                        ui.label("Material:");
+                        let mat_id = obj.material_id.min(15) as usize;
+                        let mat_name = &self.material_names[mat_id];
+                        egui::ComboBox::from_id_salt(format!("obj_mat_select_{}", i))
+                            .selected_text(format!("Slot {}: {}", mat_id, mat_name))
+                            .show_ui(ui, |ui| {
+                                for m_i in 0..GpuMaterial::NUM_PRESETS {
+                                    if ui.selectable_value(&mut obj.material_id, m_i as u32, format!("Slot {}: {}", m_i, self.material_names[m_i])).clicked() {
+                                        self.status_message = format!("Set material of '{}' to Slot {}", obj.name, m_i);
+                                    }
+                                }
+                            });
+                    });
+
+                    ui.label(RichText::new("Transform & Alignment:").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Position:");
                         ui.add(egui::DragValue::new(&mut obj.position[0]).speed(0.1).prefix("X: "));
                         ui.add(egui::DragValue::new(&mut obj.position[1]).speed(0.1).prefix("Y: "));
                         ui.add(egui::DragValue::new(&mut obj.position[2]).speed(0.1).prefix("Z: "));
+                        if ui.button("🌱 Snap to Ground").clicked() {
+                            let h = crate::terrain::evaluate_procedural_height(obj.position[0], obj.position[2], &scene_ctrl.terrain);
+                            obj.position[1] = h + obj.scale[1];
+                            self.status_message = format!("Snapped '{}' to terrain ground height {:.2}", obj.name, obj.position[1]);
+                        }
                     });
-                    ui.label("Rotation (Pitch, Yaw, Roll):");
+
                     ui.horizontal(|ui| {
+                        ui.label("Rotation:");
                         ui.add(egui::DragValue::new(&mut obj.rotation[0]).speed(1.0).suffix("°"));
                         ui.add(egui::DragValue::new(&mut obj.rotation[1]).speed(1.0).suffix("°"));
                         ui.add(egui::DragValue::new(&mut obj.rotation[2]).speed(1.0).suffix("°"));
+                        if ui.small_button("🔄 0°").clicked() {
+                            obj.rotation = [0.0, 0.0, 0.0];
+                        }
                     });
-                    ui.label("Scale / Dimensions:");
+
                     ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut obj.scale[0]).speed(0.05).prefix("Sx: "));
-                        ui.add(egui::DragValue::new(&mut obj.scale[1]).speed(0.05).prefix("Sy: "));
-                        ui.add(egui::DragValue::new(&mut obj.scale[2]).speed(0.05).prefix("Sz: "));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Material Slot:");
-                        ui.add(egui::DragValue::new(&mut obj.material_id).range(0..=15));
+                        ui.label("Scale:   ");
+                        ui.checkbox(&mut self.uniform_scale_locked, "🔒 Uniform");
+                        if self.uniform_scale_locked {
+                            let mut uniform_val = obj.scale[0];
+                            if ui.add(egui::DragValue::new(&mut uniform_val).speed(0.05).prefix("Size: ")).changed() {
+                                let clamped = uniform_val.clamp(0.05, 50.0);
+                                obj.scale = [clamped, clamped, clamped];
+                            }
+                        } else {
+                            ui.add(egui::DragValue::new(&mut obj.scale[0]).speed(0.05).prefix("Sx: "));
+                            ui.add(egui::DragValue::new(&mut obj.scale[1]).speed(0.05).prefix("Sy: "));
+                            ui.add(egui::DragValue::new(&mut obj.scale[2]).speed(0.05).prefix("Sz: "));
+                        }
                     });
                 });
             }
         }
 
         if !objects.is_empty() && self.selected_object_idx < objects.len() {
-            if ui.button("🗑️ Delete Selected Object").clicked() {
-                objects.remove(self.selected_object_idx);
-                self.selected_object_idx = self.selected_object_idx.saturating_sub(1);
-                self.status_message = "Deleted object.".to_string();
-            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("📋 Duplicate Object").clicked() {
+                    let mut cloned = objects[self.selected_object_idx].clone();
+                    cloned.name = format!("{} (Copy)", cloned.name);
+                    cloned.position[0] += 2.0;
+                    objects.push(cloned);
+                    self.selected_object_idx = objects.len() - 1;
+                    self.status_message = "Duplicated selected object.".to_string();
+                }
+                if ui.button("🎯 Frame / Focus Camera").clicked() {
+                    let target = glam::Vec3::from(objects[self.selected_object_idx].position);
+                    camera.position = target - camera.forward() * 7.0 + glam::Vec3::Y * 2.0;
+                    self.status_message = format!("Framed camera onto '{}'", objects[self.selected_object_idx].name);
+                }
+                if ui.button("🗑️ Delete Selected Object").clicked() {
+                    objects.remove(self.selected_object_idx);
+                    self.selected_object_idx = self.selected_object_idx.saturating_sub(1);
+                    self.status_message = "Deleted object.".to_string();
+                }
+            });
         }
 
         ui.separator();
@@ -1576,6 +1763,95 @@ impl EditorState {
                 }
             }
         });
+    }
+
+    /// Draw 3D Transform Gizmo, Selection Brackets, and Orientation Arrows in the Viewport
+    pub fn draw_viewport_gizmo(
+        &mut self,
+        ctx: &egui::Context,
+        camera: &Camera,
+        objects: &[SceneObject],
+        screen_w: f32,
+        screen_h: f32,
+    ) {
+        if self.selected_object_idx >= objects.len() {
+            return;
+        }
+        let obj = &objects[self.selected_object_idx];
+        if !obj.visible {
+            return;
+        }
+
+        let center_3d = glam::Vec3::from(obj.position);
+        let center_screen = match camera.project_to_screen(center_3d, screen_w, screen_h) {
+            Some(pos) => pos,
+            None => return,
+        };
+
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("3d_viewport_gizmo")));
+
+        // 1. Draw 3D Transform Gizmo Axes
+        let axis_len = (obj.scale[0].max(obj.scale[1]).max(obj.scale[2]) * 1.5).clamp(1.5, 6.0);
+        let px_3d = center_3d + glam::Vec3::X * axis_len;
+        let py_3d = center_3d + glam::Vec3::Y * axis_len;
+        let pz_3d = center_3d + glam::Vec3::Z * axis_len;
+
+        let stroke_w = 2.5;
+
+        // X Axis (Red)
+        if let Some(sx) = camera.project_to_screen(px_3d, screen_w, screen_h) {
+            painter.line_segment([center_screen, sx], egui::Stroke::new(stroke_w, Color32::from_rgb(255, 60, 60)));
+            painter.circle_filled(sx, 5.0, Color32::from_rgb(255, 70, 70));
+            painter.text(sx + egui::vec2(7.0, -7.0), egui::Align2::LEFT_CENTER, "X", egui::FontId::proportional(12.0), Color32::from_rgb(255, 100, 100));
+        }
+
+        // Y Axis (Green)
+        if let Some(sy) = camera.project_to_screen(py_3d, screen_w, screen_h) {
+            painter.line_segment([center_screen, sy], egui::Stroke::new(stroke_w, Color32::from_rgb(50, 230, 80)));
+            painter.circle_filled(sy, 5.0, Color32::from_rgb(50, 230, 80));
+            painter.text(sy + egui::vec2(7.0, -7.0), egui::Align2::LEFT_CENTER, "Y", egui::FontId::proportional(12.0), Color32::from_rgb(100, 255, 120));
+        }
+
+        // Z Axis (Blue)
+        if let Some(sz) = camera.project_to_screen(pz_3d, screen_w, screen_h) {
+            painter.line_segment([center_screen, sz], egui::Stroke::new(stroke_w, Color32::from_rgb(50, 140, 255)));
+            painter.circle_filled(sz, 5.0, Color32::from_rgb(50, 140, 255));
+            painter.text(sz + egui::vec2(7.0, -7.0), egui::Align2::LEFT_CENTER, "Z", egui::FontId::proportional(12.0), Color32::from_rgb(100, 180, 255));
+        }
+
+        // Center Origin Ring
+        painter.circle_stroke(center_screen, 6.0, egui::Stroke::new(2.0, Color32::WHITE));
+
+        // 2. Selection Brackets around object
+        let box_radius = 24.0;
+        let bracket_len = 8.0;
+        let cyan = Color32::from_rgb(0, 230, 255);
+        let b_stroke = egui::Stroke::new(1.8, cyan);
+
+        // Top-left
+        painter.line_segment([center_screen + egui::vec2(-box_radius, -box_radius + bracket_len), center_screen + egui::vec2(-box_radius, -box_radius)], b_stroke);
+        painter.line_segment([center_screen + egui::vec2(-box_radius, -box_radius), center_screen + egui::vec2(-box_radius + bracket_len, -box_radius)], b_stroke);
+
+        // Top-right
+        painter.line_segment([center_screen + egui::vec2(box_radius - bracket_len, -box_radius), center_screen + egui::vec2(box_radius, -box_radius)], b_stroke);
+        painter.line_segment([center_screen + egui::vec2(box_radius, -box_radius), center_screen + egui::vec2(box_radius, -box_radius + bracket_len)], b_stroke);
+
+        // Bottom-left
+        painter.line_segment([center_screen + egui::vec2(-box_radius, box_radius - bracket_len), center_screen + egui::vec2(-box_radius, box_radius)], b_stroke);
+        painter.line_segment([center_screen + egui::vec2(-box_radius, box_radius), center_screen + egui::vec2(-box_radius + bracket_len, box_radius)], b_stroke);
+
+        // Bottom-right
+        painter.line_segment([center_screen + egui::vec2(box_radius - bracket_len, box_radius), center_screen + egui::vec2(box_radius, box_radius)], b_stroke);
+        painter.line_segment([center_screen + egui::vec2(box_radius, box_radius), center_screen + egui::vec2(box_radius, box_radius - bracket_len)], b_stroke);
+
+        // Name tag above object
+        painter.text(
+            center_screen + egui::vec2(0.0, -box_radius - 8.0),
+            egui::Align2::CENTER_BOTTOM,
+            &obj.name,
+            egui::FontId::proportional(12.0),
+            Color32::from_rgb(255, 220, 80),
+        );
     }
 }
 

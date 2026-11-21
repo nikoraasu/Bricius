@@ -3,6 +3,7 @@ mod editor;
 mod generator;
 mod io;
 mod material;
+mod model_loader;
 mod objects;
 mod postprocess;
 mod scene;
@@ -109,14 +110,16 @@ impl ApplicationHandler for App {
             } => {
                 if *element_state == ElementState::Released {
                     state.mouse_pressed = false;
+                    state.dragging_object = false;
                     state.last_mouse_pos = None;
                 } else if *element_state == ElementState::Pressed {
                     if *button == MouseButton::Right {
                         // RMB drag always navigates the 3D viewport
                         state.mouse_pressed = true;
+                        state.dragging_object = false;
                         state.last_mouse_pos = None;
                     } else if *button == MouseButton::Left {
-                        // LMB drag navigates the viewport if not clicking an egui widget
+                        // LMB: Click to select & drag objects, or drag viewport if clicking background
                         let over_egui = if state.editor.visible {
                             if let Some(pos) = state.egui_ctx.input(|i| i.pointer.latest_pos()) {
                                 if let Some(layer) = state.egui_ctx.layer_id_at(pos) {
@@ -130,23 +133,89 @@ impl ApplicationHandler for App {
                         } else {
                             false
                         };
+
                         if !over_egui {
-                            state.mouse_pressed = true;
-                            state.last_mouse_pos = None;
+                            let mx = state.last_mouse_pos.map(|(x, _)| x).unwrap_or(state.config.width as f64 * 0.5);
+                            let my = state.last_mouse_pos.map(|(_, y)| y).unwrap_or(state.config.height as f64 * 0.5);
+                            let w = state.config.width as f32;
+                            let h = state.config.height as f32;
+                            let (ro, rd) = state.camera.screen_to_ray(mx as f32, my as f32, w, h);
+
+                            let mut closest_hit: Option<(usize, f32)> = None;
+                            for (i, obj) in state.objects.iter().enumerate() {
+                                if let Some(t) = obj.intersect_ray(ro, rd) {
+                                    if closest_hit.map_or(true, |(_, min_t)| t < min_t) {
+                                        closest_hit = Some((i, t));
+                                    }
+                                }
+                            }
+
+                            if let Some((hit_idx, _)) = closest_hit {
+                                // Object picked!
+                                state.editor.selected_object_idx = hit_idx;
+                                state.dragging_object = true;
+                                state.drag_start_obj_pos = glam::Vec3::from(state.objects[hit_idx].position);
+                                state.drag_start_mouse = glam::Vec2::new(mx as f32, my as f32);
+                                state.mouse_pressed = true;
+                                state.editor.status_message = format!("Selected '{}' - Drag in viewport to move (⇧ Shift: Height, ⌥ Alt: Scale)", state.objects[hit_idx].name);
+                            } else {
+                                state.mouse_pressed = true;
+                                state.dragging_object = false;
+                            }
                         }
                     }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if state.mouse_pressed {
+                let curr_x = position.x;
+                let curr_y = position.y;
+
+                if state.dragging_object && state.editor.selected_object_idx < state.objects.len() {
+                    let w = state.config.width as f32;
+                    let h = state.config.height as f32;
+                    let obj_idx = state.editor.selected_object_idx;
+
+                    let shift_pressed = state.keys_pressed.contains(&KeyCode::ShiftLeft) || state.keys_pressed.contains(&KeyCode::ShiftRight);
+                    let alt_pressed = state.keys_pressed.contains(&KeyCode::AltLeft) || state.keys_pressed.contains(&KeyCode::AltRight);
+
+                    if alt_pressed {
+                        // Alt + Drag: Uniform Scaling
+                        if let Some((_, last_y)) = state.last_mouse_pos {
+                            let dy = (last_y - curr_y) as f32 * 0.02;
+                            let factor = (1.0 + dy).clamp(0.05, 5.0);
+                            state.objects[obj_idx].scale[0] = (state.objects[obj_idx].scale[0] * factor).clamp(0.1, 50.0);
+                            state.objects[obj_idx].scale[1] = (state.objects[obj_idx].scale[1] * factor).clamp(0.1, 50.0);
+                            state.objects[obj_idx].scale[2] = (state.objects[obj_idx].scale[2] * factor).clamp(0.1, 50.0);
+                        }
+                    } else if shift_pressed {
+                        // Shift + Drag: Vertical Y Elevation
+                        if let Some((_, last_y)) = state.last_mouse_pos {
+                            let dy = (last_y - curr_y) as f32 * 0.04;
+                            state.objects[obj_idx].position[1] += dy;
+                        }
+                    } else {
+                        // Normal Drag: Smooth 3D plane translation
+                        let (ro, rd) = state.camera.screen_to_ray(curr_x as f32, curr_y as f32, w, h);
+                        let plane_y = state.drag_start_obj_pos.y;
+                        if rd.y.abs() > 0.001 {
+                            let t = (plane_y - ro.y) / rd.y;
+                            if t > 0.1 && t < 300.0 {
+                                let hit_point = ro + rd * t;
+                                state.objects[obj_idx].position[0] = hit_point.x;
+                                state.objects[obj_idx].position[2] = hit_point.z;
+                            }
+                        }
+                    }
+                    state.last_mouse_pos = Some((curr_x, curr_y));
+                } else if state.mouse_pressed {
                     if let Some((last_x, last_y)) = state.last_mouse_pos {
-                        let dx = (position.x - last_x) as f32;
-                        let dy = (position.y - last_y) as f32;
+                        let dx = (curr_x - last_x) as f32;
+                        let dy = (curr_y - last_y) as f32;
                         state.camera.rotate(dx, dy);
                     }
-                    state.last_mouse_pos = Some((position.x, position.y));
+                    state.last_mouse_pos = Some((curr_x, curr_y));
                 } else {
-                    state.last_mouse_pos = Some((position.x, position.y));
+                    state.last_mouse_pos = Some((curr_x, curr_y));
                 }
             }
             _ => {}
@@ -248,7 +317,11 @@ fn main() {
     println!("  - Tab              : Toggle Studio Editor UI on/off");
     println!("  - F1               : Open In-Studio Interactive Tutorial & Guide");
     println!("  - F9               : Render Still Frame to PNG (Capture artwork)");
-    println!("  - Mouse Drag (LMB) : Rotate 3D Camera / Look Around");
+    println!("  - LMB Click Object : Select 3D object in viewport");
+    println!("  - LMB Drag Object  : Move object across landscape (XZ plane)");
+    println!("  - Shift + Drag     : Move object vertically (Y elevation)");
+    println!("  - Alt + Drag       : Scale object uniformly");
+    println!("  - RMB / Drag Sky   : Rotate 3D Camera / 360° Mouse Look");
     println!("  - W, A, S, D       : Fly camera forward / left / back / right");
     println!("  - Space / E        : Fly camera Up");
     println!("  - Shift / Q        : Fly camera Down");

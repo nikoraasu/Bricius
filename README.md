@@ -56,9 +56,20 @@ Built with **Rust**, **`wgpu`**, and **`egui`**, featuring real-time procedural 
 - **16 Authentic Bryce Material Presets**:
   - `Mountain Rock`, `Blue Marble`, `90s Mirror Chrome`, `Emerald Glass`, `Hammered Gold`, `Basalt Obsidian`, `Ocean Water`, `Alien Bioluminescent`, `Bryce Plastic`, `Weathered Sandstone`, `Glacial Ice`, `Wood Grain`, `Rusted Iron`, `Amethyst Crystal`, `Cyber Grid`, `Red Desert Rock`.
 
-### 5. 🔮 3D Scene Composition, CSG Booleans & Scatter
-- **3D Primitives**: Spheres, Cubes, Cylinders, Toruses.
-- **Full 3-Axis Transforms**: Position, Rotation (Pitch, Yaw, Roll), and Non-Uniform Scale.
+### 5. 🔮 3D Scene Composition, Custom 3D Models & Direct Viewport Transform
+- **3D Primitives & Custom Models**:
+  - Primitives: Spheres, Cubes, Cylinders, Toruses, Cones, Pyramids.
+  - **Universal 3D Model Importer (`.obj`, `.glb`, `.fbx`)**:
+    - Directly import external 3D assets (Wavefront `.obj`, Binary glTF `.glb`, ASCII `.fbx`).
+    - Raytraced using hardware accelerated AABB bounding box culling and Möller–Trumbore ray-triangle intersection.
+    - Built-in iconic models: `Utah Teapot`, `Desert Monolith`, `Crystal Geode`, `Starfighter Interceptor`.
+- **Modern Viewport Interaction & 3D Dragging**:
+  - **Click to Select**: Click any object in the 3D viewport to inspect and select it.
+  - **Direct 3D Dragging**: Left-click and drag any object to glide it across the landscape in real time.
+  - **`Shift` + Drag**: Elevate the object vertically along the Y axis.
+  - **`Alt` + Drag**: Scale the object uniformly with mouse movement.
+  - **3D Transform Gizmo**: Screen-projected Red (X), Green (Y), and Blue (Z) axis handles and cyan selection brackets `[  ]`.
+  - **`Snap to Ground`**: Instantly snaps objects directly onto the terrain surface.
 - **Constructive Solid Geometry (CSG)**:
   - `Positive (Solid Union)`: regular solid objects.
   - `Negative (Subtractive Cutout)`: punches physical holes and hollow cavities through solids and terrain, with inverted normals and interior material inheritance!

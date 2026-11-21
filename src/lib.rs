@@ -3,6 +3,7 @@ pub mod editor;
 pub mod generator;
 pub mod io;
 pub mod material;
+pub mod model_loader;
 pub mod objects;
 pub mod postprocess;
 pub mod scene;

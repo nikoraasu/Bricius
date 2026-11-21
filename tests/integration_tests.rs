@@ -242,3 +242,67 @@ fn test_render_presets_and_request() {
     assert!(!photo.retro_90s_cgi);
     assert_eq!(photo.contrast, 1.02);
 }
+
+#[test]
+fn test_model_obj_and_presets() {
+    use bryce_modern::model_loader::ModelLoader;
+
+    // Test Utah Teapot preset
+    let teapot = ModelLoader::bryce_teapot();
+    assert_eq!(teapot.name, "Bryce Utah Teapot");
+    assert!(teapot.triangle_count() > 50, "Teapot should have triangles");
+    assert_eq!(teapot.normals.len(), teapot.vertices.len());
+
+    // Test Desert Monolith preset
+    let obelisk = ModelLoader::obelisk_monolith();
+    assert_eq!(obelisk.name, "Desert Monolith Obelisk");
+    assert!(obelisk.triangle_count() >= 10);
+
+    // Test Wavefront .obj parser
+    let obj_sample = r#"
+# Sample Cube OBJ
+v -1.0 -1.0 1.0
+v 1.0 -1.0 1.0
+v 1.0 1.0 1.0
+v -1.0 1.0 1.0
+f 1 2 3
+f 1 3 4
+"#;
+    let parsed_mesh = ModelLoader::load_obj(obj_sample, "TestCube").expect("Should parse OBJ cleanly");
+    assert_eq!(parsed_mesh.triangle_count(), 2);
+    assert_eq!(parsed_mesh.normals.len(), parsed_mesh.vertices.len());
+}
+
+#[test]
+fn test_ray_picking_and_object_intersection() {
+    use bryce_modern::camera::Camera;
+    use bryce_modern::objects::SceneObject;
+    use glam::Vec3;
+
+    let camera = Camera::new(Vec3::new(0.0, 0.0, 10.0), -90.0, 0.0);
+    let (ro, rd) = camera.screen_to_ray(400.0, 300.0, 800.0, 600.0);
+
+    // Sphere placed right in center of view
+    let sphere = SceneObject::sphere("Target Orb", [0.0, 0.0, 0.0], 2.0, 1);
+    let hit = sphere.intersect_ray(ro, rd);
+    assert!(hit.is_some(), "Ray should hit sphere centered along camera forward");
+    assert!(hit.unwrap() > 0.0);
+
+    // Sphere placed far off to the side (should miss)
+    let off_sphere = SceneObject::sphere("Offscreen Orb", [100.0, 0.0, 0.0], 1.0, 1);
+    let miss = off_sphere.intersect_ray(ro, rd);
+    assert!(miss.is_none(), "Ray should miss offscreen sphere");
+}
+
+#[test]
+fn test_custom_material_copy_and_serialization() {
+    use bryce_modern::material::GpuMaterial;
+
+    let mat = GpuMaterial::blue_marble();
+    let json = serde_json::to_string(&mat).expect("Material should serialize to JSON");
+    let deserialized: GpuMaterial = serde_json::from_str(&json).expect("Material should deserialize");
+
+    assert_eq!(mat.params1, deserialized.params1);
+    assert_eq!(mat.params2, deserialized.params2);
+    assert_eq!(mat.base_color, deserialized.base_color);
+}
