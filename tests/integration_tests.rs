@@ -271,6 +271,12 @@ f 1 3 4
     let parsed_mesh = ModelLoader::load_obj(obj_sample, "TestCube").expect("Should parse OBJ cleanly");
     assert_eq!(parsed_mesh.triangle_count(), 2);
     assert_eq!(parsed_mesh.normals.len(), parsed_mesh.vertices.len());
+
+    // Test load_from_file with file path
+    if std::path::Path::new("test_obj.obj").exists() {
+        let file_mesh = ModelLoader::load_from_file("test_obj.obj").expect("Should load test_obj.obj");
+        assert!(file_mesh.triangle_count() >= 12, "Cube should have at least 12 triangles");
+    }
 }
 
 #[test]

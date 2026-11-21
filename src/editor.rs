@@ -1467,39 +1467,86 @@ impl EditorState {
         });
 
         ui.separator();
-        ui.label(RichText::new("🗿 Import & Spawn 3D Mesh Models (.obj, .glb, .fbx):").strong().color(Color32::from_rgb(0, 220, 240)));
+        ui.label(RichText::new("🗿 Import & Spawn 3D Mesh Models (.obj, .glb, .gltf, .fbx):").strong().color(Color32::from_rgb(0, 220, 240)));
         ui.horizontal_wrapped(|ui| {
             if ui.button("🫖 Utah Teapot").clicked() {
-                let spawn_pos = [camera.position.x + camera.forward().x * 7.0, camera.position.y + camera.forward().y * 7.0, camera.position.z + camera.forward().z * 7.0];
-                objects.push(SceneObject::mesh("Bryce Utah Teapot", spawn_pos, [1.5, 1.5, 1.5], scene_ctrl.selected_material, 0));
+                let spawn_x = camera.position.x + camera.forward().x * 6.0;
+                let spawn_z = camera.position.z + camera.forward().z * 6.0;
+                let ground_y = crate::terrain::evaluate_procedural_height(spawn_x, spawn_z, &scene_ctrl.terrain);
+                let spawn_y = ground_y + 1.8;
+                objects.push(SceneObject::mesh("Bryce Utah Teapot", [spawn_x, spawn_y, spawn_z], [1.5, 1.5, 1.5], scene_ctrl.selected_material, 0));
                 self.selected_object_idx = objects.len() - 1;
-                self.status_message = "Spawned Utah Teapot model".to_string();
+                self.status_message = "Spawned Bryce Utah Teapot model".to_string();
             }
             if ui.button("🏛️ Desert Monolith").clicked() {
-                let spawn_pos = [camera.position.x + camera.forward().x * 8.0, camera.position.y + camera.forward().y * 8.0, camera.position.z + camera.forward().z * 8.0];
-                objects.push(SceneObject::mesh("Desert Monolith", spawn_pos, [1.5, 1.5, 1.5], scene_ctrl.selected_material, 1));
+                let spawn_x = camera.position.x + camera.forward().x * 7.0;
+                let spawn_z = camera.position.z + camera.forward().z * 7.0;
+                let ground_y = crate::terrain::evaluate_procedural_height(spawn_x, spawn_z, &scene_ctrl.terrain);
+                let spawn_y = ground_y + 2.2;
+                objects.push(SceneObject::mesh("Desert Monolith", [spawn_x, spawn_y, spawn_z], [1.5, 1.5, 1.5], scene_ctrl.selected_material, 1));
                 self.selected_object_idx = objects.len() - 1;
                 self.status_message = "Spawned Desert Monolith model".to_string();
             }
             if ui.button("💎 Crystal Geode").clicked() {
-                let spawn_pos = [camera.position.x + camera.forward().x * 7.0, camera.position.y + camera.forward().y * 7.0, camera.position.z + camera.forward().z * 7.0];
-                objects.push(SceneObject::mesh("Crystal Geode", spawn_pos, [1.5, 1.5, 1.5], scene_ctrl.selected_material, 2));
+                let spawn_x = camera.position.x + camera.forward().x * 6.5;
+                let spawn_z = camera.position.z + camera.forward().z * 6.5;
+                let ground_y = crate::terrain::evaluate_procedural_height(spawn_x, spawn_z, &scene_ctrl.terrain);
+                let spawn_y = ground_y + 1.8;
+                objects.push(SceneObject::mesh("Crystal Geode", [spawn_x, spawn_y, spawn_z], [1.5, 1.5, 1.5], scene_ctrl.selected_material, 2));
                 self.selected_object_idx = objects.len() - 1;
                 self.status_message = "Spawned Crystal Geode model".to_string();
             }
             if ui.button("🚀 Starfighter").clicked() {
-                let spawn_pos = [camera.position.x + camera.forward().x * 8.0, camera.position.y + camera.forward().y * 8.0, camera.position.z + camera.forward().z * 8.0];
-                objects.push(SceneObject::mesh("Starfighter Interceptor", spawn_pos, [1.5, 1.5, 1.5], scene_ctrl.selected_material, 3));
+                let spawn_x = camera.position.x + camera.forward().x * 7.5;
+                let spawn_z = camera.position.z + camera.forward().z * 7.5;
+                let ground_y = crate::terrain::evaluate_procedural_height(spawn_x, spawn_z, &scene_ctrl.terrain);
+                let spawn_y = ground_y + 3.0; // Hovering flight altitude
+                objects.push(SceneObject::mesh("Starfighter Interceptor", [spawn_x, spawn_y, spawn_z], [1.5, 1.5, 1.5], scene_ctrl.selected_material, 3));
                 self.selected_object_idx = objects.len() - 1;
                 self.status_message = "Spawned Starfighter model".to_string();
             }
         });
 
         ui.horizontal(|ui| {
-            ui.label("Model File Path:");
-            ui.add(egui::TextEdit::singleline(&mut self.model_file_path_input).hint_text("model.obj, .glb, .fbx"));
-            if ui.button("📂 Load 3D Model").clicked() {
-                let trimmed = self.model_file_path_input.trim();
+            if ui.button("📂 Browse File...").clicked() {
+                if let Some(file_path) = rfd::FileDialog::new()
+                    .add_filter("3D Models (*.obj, *.glb, *.gltf, *.fbx)", &["obj", "glb", "gltf", "fbx"])
+                    .pick_file()
+                {
+                    let path_str = file_path.to_string_lossy().to_string();
+                    self.model_file_path_input = path_str.clone();
+                    match crate::model_loader::ModelLoader::load_from_file(&path_str) {
+                        Ok(loaded_mesh) => {
+                            let name = loaded_mesh.name.clone();
+                            let tri_cnt = loaded_mesh.triangle_count();
+                            let mesh_idx = meshes.len();
+                            meshes.push(loaded_mesh);
+                            *mesh_dirty = true;
+                            let spawn_x = camera.position.x + camera.forward().x * 6.5;
+                            let spawn_z = camera.position.z + camera.forward().z * 6.5;
+                            let ground_y = crate::terrain::evaluate_procedural_height(spawn_x, spawn_z, &scene_ctrl.terrain);
+                            let spawn_y = ground_y + 1.8;
+                            objects.push(SceneObject::mesh(
+                                &name,
+                                [spawn_x, spawn_y, spawn_z],
+                                [1.5, 1.5, 1.5],
+                                scene_ctrl.selected_material,
+                                mesh_idx,
+                            ));
+                            self.selected_object_idx = objects.len() - 1;
+                            self.status_message = format!("Successfully imported '{}' ({} triangles)", name, tri_cnt);
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Import error: {}", e);
+                        }
+                    }
+                }
+            }
+
+            ui.label("Path:");
+            ui.add(egui::TextEdit::singleline(&mut self.model_file_path_input).hint_text("model.obj, .glb, .gltf, .fbx"));
+            if ui.button("📥 Load").clicked() {
+                let trimmed = self.model_file_path_input.trim().trim_matches('"').trim();
                 if !trimmed.is_empty() {
                     match crate::model_loader::ModelLoader::load_from_file(trimmed) {
                         Ok(loaded_mesh) => {
@@ -1508,14 +1555,13 @@ impl EditorState {
                             let mesh_idx = meshes.len();
                             meshes.push(loaded_mesh);
                             *mesh_dirty = true;
-                            let spawn_pos = [
-                                camera.position.x + camera.forward().x * 7.0,
-                                camera.position.y + camera.forward().y * 7.0,
-                                camera.position.z + camera.forward().z * 7.0,
-                            ];
+                            let spawn_x = camera.position.x + camera.forward().x * 6.5;
+                            let spawn_z = camera.position.z + camera.forward().z * 6.5;
+                            let ground_y = crate::terrain::evaluate_procedural_height(spawn_x, spawn_z, &scene_ctrl.terrain);
+                            let spawn_y = ground_y + 1.8;
                             objects.push(SceneObject::mesh(
                                 &name,
-                                spawn_pos,
+                                [spawn_x, spawn_y, spawn_z],
                                 [1.5, 1.5, 1.5],
                                 scene_ctrl.selected_material,
                                 mesh_idx,

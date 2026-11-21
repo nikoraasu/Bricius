@@ -622,7 +622,8 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
             // MESH / 3D MODEL (AABB Bounding Box culling + Möller–Trumbore ray-triangle intersection)
             let box_min = -scale;
             let box_max = scale;
-            let inv_d = 1.0 / rd_local;
+            let safe_rd = select(rd_local, sign(rd_local) * 0.00001, abs(rd_local) < vec3<f32>(0.00001));
+            let inv_d = 1.0 / safe_rd;
             let t0s = (box_min - ro_local) * inv_d;
             let t1s = (box_max - ro_local) * inv_d;
             let t_min = max(max(min(t0s.x, t1s.x), min(t0s.y, t1s.y)), min(t0s.z, t1s.z));
@@ -630,13 +631,13 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
 
             if (t_max >= max(0.05, t_min) && t_min < closest.t) {
                 let tri_start = u32(prim.extra.y + 0.5);
-                let tri_count = u32(prim.extra.z + 0.5);
+                let tri_count = min(u32(prim.extra.z + 0.5), 3500u);
 
                 for (var t_idx = 0u; t_idx < tri_count; t_idx = t_idx + 1u) {
                     let tri = mesh_triangles[tri_start + t_idx];
-                    let v0 = tri.v0.xyz;
-                    let v1 = tri.v1.xyz;
-                    let v2 = tri.v2.xyz;
+                    let v0 = tri.v0.xyz * scale;
+                    let v1 = tri.v1.xyz * scale;
+                    let v2 = tri.v2.xyz * scale;
 
                     let edge1 = v1 - v0;
                     let edge2 = v2 - v0;
@@ -656,7 +657,10 @@ fn intersect_scene(ro: vec3<f32>, rd: vec3<f32>) -> HitInfo {
                                     closest.hit = true;
                                     closest.t = t_hit;
                                     closest.pos = ro + rd * t_hit;
-                                    let n_world = normalize(rotate_x(rotate_y(rotate_z(tri.normal.xyz, rad_rot.z), rad_rot.y), rad_rot.x));
+                                    var n_world = normalize(rotate_x(rotate_y(rotate_z(tri.normal.xyz, rad_rot.z), rad_rot.y), rad_rot.x));
+                                    if (dot(n_world, rd) > 0.0) {
+                                        n_world = -n_world;
+                                    }
                                     closest.normal = n_world;
                                     closest.mat_id = mat_id;
                                     closest.is_water = false;
