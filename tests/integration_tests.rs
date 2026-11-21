@@ -201,3 +201,23 @@ fn test_project_save_load_roundtrip() {
 
     let _ = fs::remove_file(test_path);
 }
+
+#[test]
+fn test_camera_drag_rotation() {
+    use bryce_modern::camera::Camera;
+    use glam::Vec3;
+
+    let mut camera = Camera::new(Vec3::new(0.0, 5.0, 10.0), -90.0, 0.0);
+    let initial_forward = camera.forward();
+
+    // Drag right (dx = 50.0 pixels)
+    camera.rotate(50.0, 0.0);
+    let right_forward = camera.forward();
+    assert_ne!(initial_forward, right_forward, "Camera should rotate on horizontal drag");
+
+    // Drag down (dy = 30.0 pixels)
+    camera.rotate(0.0, 30.0);
+    let down_forward = camera.forward();
+    assert_ne!(right_forward, down_forward, "Camera should rotate on vertical drag");
+    assert!(camera.pitch < 0.0, "Camera should pitch downwards");
+}
