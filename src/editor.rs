@@ -10,23 +10,40 @@ use crate::scene::SceneController;
 use crate::terrain::{BrushMode, HeightmapGrid, TerrainAlgorithm};
 use crate::water::WaterType;
 
-/// Classic Bryce elevation colormap: deep water -> shallow -> sand -> forest -> rock -> snow
+/// Classic Bryce elevation colormap with smooth linear interpolation:
+/// deep water -> shallow -> sand -> forest -> rock -> granite -> snow
 fn height_to_bryce_color(h: f32) -> Color32 {
-    if h < -0.5 {
-        Color32::from_rgb(20, 60, 120) // Deep water
-    } else if h < 0.2 {
-        Color32::from_rgb(45, 120, 180) // Shallow turquoise water
-    } else if h < 0.8 {
-        Color32::from_rgb(220, 195, 135) // Beach sand
-    } else if h < 3.5 {
-        Color32::from_rgb(55, 125, 45) // Lowland vegetation
-    } else if h < 7.0 {
-        Color32::from_rgb(115, 105, 90) // Highland rock
-    } else if h < 11.0 {
-        Color32::from_rgb(160, 155, 150) // Mountain crest granite
-    } else {
-        Color32::from_rgb(240, 245, 255) // Alpine snow
+    let stops: &[(f32, Color32)] = &[
+        (-2.0, Color32::from_rgb(14, 38, 85)),    // Deep oceanic trench
+        (-0.5, Color32::from_rgb(22, 65, 130)),   // Deep water
+        (0.2, Color32::from_rgb(45, 135, 195)),   // Shallow turquoise lagoon
+        (0.8, Color32::from_rgb(225, 200, 140)),  // Beach shoreline sand
+        (3.5, Color32::from_rgb(50, 130, 45)),    // Lush green lowlands
+        (7.0, Color32::from_rgb(115, 105, 90)),   // Highland rock & scree
+        (11.0, Color32::from_rgb(165, 160, 155)), // Granite peaks
+        (15.0, Color32::from_rgb(245, 250, 255)), // Glacial snow
+    ];
+
+    if h <= stops[0].0 {
+        return stops[0].1;
     }
+    let last = stops.len() - 1;
+    if h >= stops[last].0 {
+        return stops[last].1;
+    }
+
+    for i in 0..last {
+        let (h0, c0) = stops[i];
+        let (h1, c1) = stops[i + 1];
+        if h >= h0 && h <= h1 {
+            let t = ((h - h0) / (h1 - h0)).clamp(0.0, 1.0);
+            let r = (c0.r() as f32 * (1.0 - t) + c1.r() as f32 * t) as u8;
+            let g = (c0.g() as f32 * (1.0 - t) + c1.g() as f32 * t) as u8;
+            let b = (c0.b() as f32 * (1.0 - t) + c1.b() as f32 * t) as u8;
+            return Color32::from_rgb(r, g, b);
+        }
+    }
+    stops[last].1
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
@@ -57,6 +74,7 @@ pub struct EditorState {
     pub scatter_config: ScatterSystem,
     pub tutorial_step: usize,
     pub show_controls_hud: bool,
+    pub request_render: bool,
     pub status_message: String,
     pub fps: f32,
     pub frame_time_ms: f32,
@@ -82,6 +100,7 @@ impl EditorState {
             scatter_config: ScatterSystem::default(),
             tutorial_step: 0,
             show_controls_hud: true,
+            request_render: false,
             status_message: "Welcome to Bryce 7 Pro Studio! Follow the tutorial or press F1 anytime.".to_string(),
             fps: 60.0,
             frame_time_ms: 16.6,
@@ -187,6 +206,9 @@ impl EditorState {
                                 if ui.button(if self.show_controls_hud { "⌨️ Hide HUD" } else { "⌨️ Controls HUD" }).clicked() {
                                     self.show_controls_hud = !self.show_controls_hud;
                                 }
+                                if ui.button(RichText::new("📸 Render [F9]").color(Color32::from_rgb(0, 240, 210)).strong()).clicked() {
+                                    self.request_render = true;
+                                }
                                 ui.label(format!("{:.1} FPS ({:.1} ms)", self.fps, self.frame_time_ms));
                             });
                         });
@@ -247,6 +269,10 @@ impl EditorState {
 
                                 ui.label(RichText::new("F1").monospace().strong().color(Color32::from_rgb(255, 205, 50)));
                                 ui.label(RichText::new("Open Studio Tutorial & Guide").size(11.0));
+                                ui.end_row();
+
+                                ui.label(RichText::new("F9").monospace().strong().color(Color32::from_rgb(0, 240, 210)));
+                                ui.label(RichText::new("📸 Render Still Image (.png)").size(11.0));
                                 ui.end_row();
                             });
                             ui.separator();
@@ -1466,7 +1492,28 @@ impl EditorState {
         materials: &[GpuMaterial; GpuMaterial::NUM_PRESETS],
         objects: &[SceneObject],
     ) {
-        ui.heading("Render Aesthetics & Optics");
+        ui.heading("Render Aesthetics & Production Output");
+
+        ui.horizontal(|ui| {
+            if ui.button(RichText::new("📸 Render Still Frame to PNG [F9]").strong().size(14.0).color(Color32::from_rgb(0, 240, 220))).clicked() {
+                self.request_render = true;
+            }
+            ui.label(RichText::new("Renders pristine raytraced artwork at native resolution without UI overlays.").italics());
+        });
+
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Render Style Presets:").strong());
+            if ui.button("✨ Smooth Modern Filmic").clicked() {
+                scene_ctrl.postprocess = crate::postprocess::PostProcessConfig::photorealistic_preset();
+                self.status_message = "Applied Smooth Modern Filmic preset (High 32-bit precision, no quantization).".to_string();
+            }
+            if ui.button("💾 Retro 1990s Bryce").clicked() {
+                scene_ctrl.postprocess = crate::postprocess::PostProcessConfig::retro_bryce_preset();
+                self.status_message = "Applied Retro 1990s Bryce preset (Vibrant, high saturation, 90s aesthetic).".to_string();
+            }
+        });
 
         ui.horizontal(|ui| {
             ui.label("Render Quality:");
@@ -1481,7 +1528,7 @@ impl EditorState {
                 });
         });
 
-        ui.checkbox(&mut scene_ctrl.postprocess.retro_90s_cgi, "💾 Retro 1990s Bryce CGI Mode (Vibrant, Saturated, Glossy)");
+        ui.checkbox(&mut scene_ctrl.postprocess.retro_90s_cgi, "💾 Retro 1990s Bryce CGI Mode (Vibrant midtones & synthetic grading)");
 
         ui.add(Slider::new(&mut scene_ctrl.postprocess.contrast, 0.8..=1.8).text("Contrast"));
         ui.add(Slider::new(&mut scene_ctrl.postprocess.saturation, 0.5..=2.0).text("Saturation"));

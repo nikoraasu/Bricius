@@ -221,3 +221,24 @@ fn test_camera_drag_rotation() {
     assert_ne!(right_forward, down_forward, "Camera should rotate on vertical drag");
     assert!(camera.pitch < 0.0, "Camera should pitch downwards");
 }
+
+#[test]
+fn test_render_presets_and_request() {
+    use bryce_modern::editor::EditorState;
+    use bryce_modern::postprocess::PostProcessConfig;
+
+    let mut editor = EditorState::new();
+    assert_eq!(editor.request_render, false);
+
+    // Trigger render request
+    editor.request_render = true;
+    assert_eq!(editor.request_render, true);
+
+    let retro = PostProcessConfig::retro_bryce_preset();
+    assert!(retro.retro_90s_cgi);
+    assert_eq!(retro.contrast, 1.25);
+
+    let photo = PostProcessConfig::photorealistic_preset();
+    assert!(!photo.retro_90s_cgi);
+    assert_eq!(photo.contrast, 1.02);
+}

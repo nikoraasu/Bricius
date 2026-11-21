@@ -94,6 +94,10 @@ impl ApplicationHandler for App {
                 state.editor.visible = true;
                 return;
             }
+            if *key_code == KeyCode::F9 && *element_state == ElementState::Pressed {
+                state.editor.request_render = true;
+                return;
+            }
         }
 
         // 3. Viewport Mouse Drag Camera Rotation (Supports both LMB & RMB)
@@ -243,6 +247,7 @@ fn main() {
     println!(" Controls:");
     println!("  - Tab              : Toggle Studio Editor UI on/off");
     println!("  - F1               : Open In-Studio Interactive Tutorial & Guide");
+    println!("  - F9               : Render Still Frame to PNG (Capture artwork)");
     println!("  - Mouse Drag (LMB) : Rotate 3D Camera / Look Around");
     println!("  - W, A, S, D       : Fly camera forward / left / back / right");
     println!("  - Space / E        : Fly camera Up");

@@ -95,13 +95,17 @@ fn hash33(p: vec3<f32>) -> vec3<f32> {
 }
 
 fn hash13(p: vec3<f32>) -> f32 {
-    return fract(sin(dot(p, vec3<f32>(12.9898, 78.233, 45.164))) * 43758.5453);
+    var p3 = fract(p * 0.1031);
+    let d = dot(p3, p3.zyx + vec3<f32>(31.32));
+    p3 = p3 + vec3<f32>(d);
+    return fract((p3.x + p3.y) * p3.z);
 }
 
 fn noise3d(p: vec3<f32>) -> f32 {
     let i = floor(p);
     let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
+    // Quintic Hermite interpolant for smooth C2 continuous derivatives (eliminates bump noise/creases)
+    let u = f * f * f * (f * (f * 6.0 - vec3<f32>(15.0)) + vec3<f32>(10.0));
 
     let n000 = hash13(i + vec3<f32>(0.0, 0.0, 0.0));
     let n100 = hash13(i + vec3<f32>(1.0, 0.0, 0.0));
@@ -264,7 +268,7 @@ fn evaluate_material(
     // Procedural normal perturbation
     var perturbed_normal = geom_normal;
     if (bump_strength > 0.001) {
-        let eps = 0.02;
+        let eps = 0.035;
         var p_dx = pattern_val;
         var p_dy = pattern_val;
         var p_dz = pattern_val;
@@ -273,6 +277,10 @@ fn evaluate_material(
             p_dx = fbm_3d(sample_p + vec3<f32>(eps, 0.0, 0.0), octaves);
             p_dy = fbm_3d(sample_p + vec3<f32>(0.0, eps, 0.0), octaves);
             p_dz = fbm_3d(sample_p + vec3<f32>(0.0, 0.0, eps), octaves);
+        } else if (noise_type == 2u) {
+            p_dx = ridged_mf_3d(sample_p + vec3<f32>(eps, 0.0, 0.0), octaves, 1.5);
+            p_dy = ridged_mf_3d(sample_p + vec3<f32>(0.0, eps, 0.0), octaves, 1.5);
+            p_dz = ridged_mf_3d(sample_p + vec3<f32>(0.0, 0.0, eps), octaves, 1.5);
         } else if (noise_type == 3u) {
             p_dx = domain_warp_3d(sample_p + vec3<f32>(eps, 0.0, 0.0), warp, octaves);
             p_dy = domain_warp_3d(sample_p + vec3<f32>(0.0, eps, 0.0), warp, octaves);
@@ -284,7 +292,8 @@ fn evaluate_material(
         }
 
         let grad = vec3<f32>(p_dx - pattern_val, p_dy - pattern_val, p_dz - pattern_val) / eps;
-        perturbed_normal = normalize(geom_normal - grad * bump_strength);
+        let bump_factor = bump_strength * 0.12;
+        perturbed_normal = normalize(geom_normal - grad * bump_factor);
     }
 
     var surf: EvaluatedSurface;
@@ -401,11 +410,12 @@ fn terrain_height(xz: vec2<f32>) -> f32 {
 }
 
 fn terrain_normal(xz: vec2<f32>) -> vec3<f32> {
-    let eps = 0.08;
-    let h = terrain_height(xz);
-    let hx = terrain_height(xz + vec2<f32>(eps, 0.0));
-    let hz = terrain_height(xz + vec2<f32>(0.0, eps));
-    return normalize(vec3<f32>(h - hx, eps, h - hz));
+    let eps = 0.10;
+    let h_l = terrain_height(xz - vec2<f32>(eps, 0.0));
+    let h_r = terrain_height(xz + vec2<f32>(eps, 0.0));
+    let h_d = terrain_height(xz - vec2<f32>(0.0, eps));
+    let h_u = terrain_height(xz + vec2<f32>(0.0, eps));
+    return normalize(vec3<f32>(h_l - h_r, 2.0 * eps, h_d - h_u));
 }
 
 // =============================================================================

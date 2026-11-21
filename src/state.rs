@@ -467,6 +467,12 @@ impl State {
     }
 
     pub fn render(&mut self) -> Result<(), &'static str> {
+        // If user requested a still-image render, capture pristine frame to PNG
+        if self.editor.request_render {
+            self.editor.request_render = false;
+            self.capture_still_frame();
+        }
+
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
@@ -572,5 +578,158 @@ impl State {
         output.present();
 
         Ok(())
+    }
+
+    pub fn capture_still_frame(&mut self) {
+        let width = self.config.width.max(1);
+        let height = self.config.height.max(1);
+
+        let capture_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Still Render Capture Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let view = capture_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Still Render Encoder"),
+        });
+
+        // 1. Render pure 3D procedural environment (no UI)
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Still Scene Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.05,
+                            g: 0.10,
+                            b: 0.15,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        }
+
+        // 2. Setup Staging Buffer to copy pixels back to CPU
+        let bytes_per_pixel = 4;
+        let unpadded_bytes_per_row = width * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT; // 256
+        let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
+        let buffer_size = (padded_bytes_per_row * height) as wgpu::BufferAddress;
+
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Still Render Staging Buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &capture_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let submission_index = self.queue.submit(Some(encoder.finish()));
+
+        // 3. Map staging buffer synchronously
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: None,
+        });
+        if let Ok(Ok(())) = rx.recv() {
+            let data = buffer_slice.get_mapped_range();
+            let mut rgba_pixels = Vec::with_capacity((width * height * 4) as usize);
+
+            let is_bgra = matches!(
+                self.config.format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            );
+
+            for y in 0..height {
+                let row_start = (y * padded_bytes_per_row) as usize;
+                for x in 0..width {
+                    let px = row_start + (x * 4) as usize;
+                    if is_bgra {
+                        let b = data[px];
+                        let g = data[px + 1];
+                        let r = data[px + 2];
+                        let a = data[px + 3];
+                        rgba_pixels.extend_from_slice(&[r, g, b, a]);
+                    } else {
+                        let r = data[px];
+                        let g = data[px + 1];
+                        let b = data[px + 2];
+                        let a = data[px + 3];
+                        rgba_pixels.extend_from_slice(&[r, g, b, a]);
+                    }
+                }
+            }
+            drop(data);
+            staging_buffer.unmap();
+
+            if let Some(img) = image::RgbaImage::from_raw(width, height, rgba_pixels) {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let path = format!("bryce_render_{}.png", timestamp);
+                match img.save(&path) {
+                    Ok(_) => {
+                        let _ = img.save("bryce_artwork.png");
+                        self.editor.status_message = format!("📸 Rendered & saved {} ({}x{})", path, width, height);
+                        println!("📸 Rendered still frame saved to: {}", path);
+                    }
+                    Err(e) => {
+                        self.editor.status_message = format!("Render save error: {}", e);
+                    }
+                }
+            }
+        }
     }
 }
